@@ -46,3 +46,9 @@ htmlcov/
 
 # Ignore log files
 *.log
+
+# ONNX models / caches — fetched at runtime from HuggingFace
+onnx-models/
+ort-wheels/
+hf_cache/
+logs/
