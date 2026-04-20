@@ -25,6 +25,15 @@ generation_defaults:
   seed: 0
   speed_factor: 1.0
   language: en
+streaming:
+  # Latency budget for the first audio chunk. Engine derives chunk_tokens (K1)
+  # from this using measured LM step + vocoder cost. 800 ms is a conservative
+  # default on DGX Spark (K1 ~= 40 tokens ~= 1.6 s of audio).
+  first_chunk_budget_ms: 800
+  # Crossfade (ms) at the chunk1/chunk2 boundary to mask CFM noise differences.
+  crossfade_ms: 30
+  # Optional override: force a specific K1. Leave null to let the budget drive it.
+  first_chunk_tokens_override: null
 audio_output:
   format: wav
   sample_rate: 24000

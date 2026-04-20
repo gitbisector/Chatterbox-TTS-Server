@@ -469,6 +469,57 @@ def _present_to_past(out_dict: dict) -> dict:
     }
 
 
+# ---- Streaming helpers ---------------------------------------------------
+
+# Audio samples emitted per speech token at S3GEN_SR (25 Hz tokens × 960 samples = 24 kHz).
+SAMPLES_PER_SPEECH_TOKEN = S3GEN_SR // 25  # 960
+
+# Measured on DGX Spark after arena warmup: LM ~11 ms/step, vocoder ~300 ms fixed +
+# small per-token cost. These are conservative defaults; real deployments should
+# set `streaming_first_chunk_budget_ms` in config and let `_compute_first_chunk_tokens`
+# derive K1. See `project_spark_loader_profiling.md` and the streaming plan.
+_LM_STEP_MS_DEFAULT = 12.0
+_VOCODER_FIXED_MS = 300.0
+_VOCODER_PER_TOKEN_MS = 1.0
+_STREAM_OVERHEAD_MS = 120.0  # SE + ET + network/framing
+
+
+def _compute_first_chunk_tokens(budget_ms: float,
+                                lm_step_ms: float = _LM_STEP_MS_DEFAULT,
+                                vocoder_fixed_ms: float = _VOCODER_FIXED_MS,
+                                vocoder_per_token_ms: float = _VOCODER_PER_TOKEN_MS,
+                                overhead_ms: float = _STREAM_OVERHEAD_MS,
+                                min_tokens: int = 25,
+                                max_tokens: int = 150) -> int:
+    """Largest K1 whose first-chunk cost fits in `budget_ms`.
+
+    Solves  K·lm_step + (vocoder_fixed + K·vocoder_per_token) + overhead ≤ budget.
+    Floors at `min_tokens` so we never stream sub-1-second chunks (prosody goes
+    bad below ~25 tokens ≈ 1 s audio) — if the budget is that tight, just
+    degrade to one-shot by returning `min_tokens` and letting the caller decide.
+    Ceils at `max_tokens` to keep first-audio reasonable on fast hardware.
+    """
+    denom = max(1e-6, lm_step_ms + vocoder_per_token_ms)
+    headroom = budget_ms - vocoder_fixed_ms - overhead_ms
+    k = int(headroom / denom) if headroom > 0 else 0
+    return max(min_tokens, min(max_tokens, k))
+
+
+def _emit_pcm(wav_f32: np.ndarray) -> bytes:
+    """Float32 waveform in [-1, 1] → int16 little-endian PCM bytes."""
+    clipped = np.clip(wav_f32, -1.0, 1.0)
+    return (clipped * 32767.0).astype(np.int16).tobytes()
+
+
+def _linear_crossfade(tail_a: np.ndarray, head_b: np.ndarray) -> np.ndarray:
+    """Equal-length linear crossfade. tail_a fades out, head_b fades in."""
+    n = min(len(tail_a), len(head_b))
+    if n == 0:
+        return np.concatenate([tail_a, head_b])
+    fade = np.linspace(1.0, 0.0, n, dtype=np.float32)
+    return tail_a[:n] * fade + head_b[:n] * (1.0 - fade)
+
+
 def synthesize(
     text: str,
     audio_prompt_path: Optional[str] = None,
@@ -641,6 +692,265 @@ def synthesize(
     except Exception as e:
         logger.error(f"ONNX v2 synthesis error: {e}", exc_info=True)
         return None, None
+
+
+def synthesize_stream(
+    text: str,
+    audio_prompt_path: Optional[str] = None,
+    temperature: float = 0.8,
+    exaggeration: float = 0.5,
+    cfg_weight: float = 0.5,
+    seed: int = 0,
+    language: str = "en",
+    first_chunk_budget_ms: Optional[float] = None,
+    first_chunk_tokens_override: Optional[int] = None,
+    crossfade_ms: float = 30.0,
+):
+    """Generator yielding (pcm_bytes, sample_rate) for the utterance.
+
+    Fires the vocoder twice per utterance in the common case:
+    - Chunk 1 once we've decoded K1 speech tokens (K1 derived from budget)
+    - Chunk 2 after EOS, on [prompt | all generated]
+
+    The two vocoder passes overlap in time-domain content; chunk 2's start
+    re-generates chunk 1's audio up to the boundary. We hold back the last
+    `crossfade_ms` of chunk 1's emitted audio and cross-fade into chunk 2's
+    corresponding region to mask CFM noise differences at the boundary.
+
+    If EOS fires before K1 (short utterance), yields one chunk identical to
+    `synthesize()`'s output (no streaming boundary to worry about).
+    """
+    if not MODEL_LOADED:
+        logger.error("ONNX v2 TTS model is not loaded.")
+        return
+
+    try:
+        if seed != 0:
+            set_seed(seed)
+
+        lang = language.lower() if language else "en"
+        if lang not in SUPPORTED_LANGUAGES:
+            logger.warning(f"Unsupported language '{lang}', falling back to 'en'")
+            lang = "en"
+
+        # Resolve chunk sizing: explicit override wins, else derive from budget,
+        # else fall back to config, else conservative default (800 ms target).
+        if first_chunk_tokens_override is not None:
+            k1 = max(1, int(first_chunk_tokens_override))
+        else:
+            budget = first_chunk_budget_ms
+            if budget is None:
+                budget = float(config_manager.get_int("streaming.first_chunk_budget_ms", 800))
+            k1 = _compute_first_chunk_tokens(budget)
+        logger.info(f"Streaming config: K1={k1} tokens (~{k1/25.0:.2f} s audio)")
+
+        # ---- Identical setup to synthesize() up to the decode loop. ----
+        voice_path = audio_prompt_path or str(_default_voice_path)
+        audio_values, _ = librosa.load(voice_path, sr=S3GEN_SR)
+        audio_values = audio_values[np.newaxis, :].astype(np.float32)
+
+        prepared_text = _prepare_language(text, lang)
+        input_ids = _tokenizer(prepared_text, return_tensors="np")["input_ids"].astype(np.int64)
+        position_ids = np.where(
+            input_ids >= START_SPEECH_TOKEN,
+            0,
+            np.arange(input_ids.shape[1])[np.newaxis, :] - 1,
+        ).astype(np.int64)
+
+        se_out = _speech_encoder_session.run(None, {"audio_values": audio_values})
+        cond_emb_np, prompt_token, ref_x_vector, prompt_feat = se_out
+        cond_emb_b2 = np.broadcast_to(
+            cond_emb_np.astype(np.float16),
+            (2, cond_emb_np.shape[1], cond_emb_np.shape[2]),
+        ).copy()
+        cond_len = cond_emb_b2.shape[1]
+
+        bos_ids = np.array([[START_SPEECH_TOKEN]], dtype=np.int64)
+        input_ids_with_bos = np.concatenate([input_ids, bos_ids], axis=1)
+        bos_pos = np.array([[0]], dtype=np.int64)
+        position_ids_with_bos = np.concatenate([position_ids, bos_pos], axis=1)
+
+        input_ids_b2 = np.concatenate([input_ids_with_bos, input_ids_with_bos], axis=0)
+        position_ids_b2 = np.concatenate([position_ids_with_bos, position_ids_with_bos], axis=0)
+        text_embeds = _embed_tokens_session.run(None, {
+            "input_ids": input_ids_b2,
+            "position_ids": position_ids_b2,
+            "exaggeration": np.array([exaggeration], dtype=np.float32),
+        })[0]
+        text_len = input_ids.shape[1]
+
+        prefill_embeds = np.concatenate([cond_emb_b2, text_embeds], axis=1)
+        batch_size, prefill_len, _ = prefill_embeds.shape
+        attention_mask = np.ones((batch_size, prefill_len), dtype=np.int64)
+        past_kv = {
+            f"past_key_values.{l}.{kv}": np.zeros((batch_size, NUM_KEY_VALUE_HEADS, 0, HEAD_DIM), dtype=np.float16)
+            for l in range(NUM_HIDDEN_LAYERS)
+            for kv in ("key", "value")
+        }
+        cfg_scalar = np.array(cfg_weight, dtype=np.float16)
+
+        max_new_tokens = config_manager.get_int("generation_defaults.max_tokens", 800)
+        t_gen_start = time.perf_counter()
+        t_first_emit = None
+        rep_proc = RepetitionPenaltyLogitsProcessor(penalty=2.0)
+        generate_tokens = np.array([[START_SPEECH_TOKEN]], dtype=np.int64)
+
+        analyzer = AlignmentStreamAnalyzer(
+            text_tokens_slice=(cond_len, cond_len + text_len),
+            eos_idx=STOP_SPEECH_TOKEN,
+        )
+
+        logger.info(
+            f"ONNX v2 stream-gen start lang={lang} cond_len={cond_len} text_len={text_len}"
+        )
+
+        # Prefill + first sampled token (same as synthesize()).
+        out = _run_lm(prefill_embeds, attention_mask, cfg_scalar, past_kv)
+        past_kv = _present_to_past(out)
+        logits_step = out["logits"][:, -1, :].astype(np.float32)
+        logits_step = analyzer.step(logits_step, out["attn_layers"], next_token=None)
+        next_token = _sample(logits_step, generate_tokens, temperature, rep_proc)
+        generate_tokens = np.concatenate([generate_tokens, next_token], axis=-1)
+
+        steps_run = 1
+        hit_eos = int(next_token[0, 0]) == STOP_SPEECH_TOKEN
+        chunk1_emitted = False     # did we emit a partial chunk before EOS?
+        crossfade_samples = int(crossfade_ms * S3GEN_SR / 1000.0)
+        held_back_tail: Optional[np.ndarray] = None  # fade-out region held back for crossfade
+        chunk1_audio_len: Optional[int] = None  # chunk 1's emitted audio length in samples
+
+        if not hit_eos:
+            for i in range(1, max_new_tokens):
+                nt_b2 = np.concatenate([next_token, next_token], axis=0)
+                pos_ids_b2 = np.full((2, 1), i, dtype=np.int64)
+                step_embeds = _embed_tokens_session.run(None, {
+                    "input_ids": nt_b2,
+                    "position_ids": pos_ids_b2,
+                    "exaggeration": np.array([exaggeration], dtype=np.float32),
+                })[0]
+                attention_mask = np.concatenate(
+                    [attention_mask, np.ones((batch_size, 1), dtype=np.int64)], axis=1
+                )
+                out = _run_lm(step_embeds, attention_mask, cfg_scalar, past_kv)
+                past_kv = _present_to_past(out)
+                logits_step = out["logits"][:, -1, :].astype(np.float32)
+                logits_step = analyzer.step(logits_step, out["attn_layers"], next_token=int(next_token[0, 0]))
+                next_token = _sample(logits_step, generate_tokens, temperature, rep_proc)
+                generate_tokens = np.concatenate([generate_tokens, next_token], axis=-1)
+                steps_run += 1
+
+                if int(next_token[0, 0]) == STOP_SPEECH_TOKEN:
+                    logger.info(f"EOS at step {i+1}")
+                    hit_eos = True
+                    break
+
+                # Fire chunk 1 vocoder once we've accumulated K1 generated tokens
+                # (prefix excludes the seed START_SPEECH_TOKEN, hence -1).
+                if (not chunk1_emitted) and (steps_run - 1 >= k1):
+                    gen_tail = generate_tokens[:, 1:]  # strip START_SPEECH_TOKEN
+                    chunk1_tokens = np.concatenate([prompt_token, gen_tail], axis=1)
+                    wav_c1 = _cond_decoder_session.run(None, {
+                        "speech_tokens": chunk1_tokens,
+                        "speaker_embeddings": ref_x_vector,
+                        "speaker_features": prompt_feat,
+                    })[0]
+                    # Decoder already trims prompt audio internally — wav_c1 is
+                    # just the generated speech.
+                    gen_audio_c1 = np.squeeze(wav_c1, axis=0)
+
+                    # Discard chunk 1's last CHUNK1_TAIL_MARGIN_TOKENS worth of
+                    # audio: the vocoder generated those without future context
+                    # and they tend to contain edge artifacts (dropped consonants,
+                    # flutter). Chunk 2 re-generates them with full context.
+                    CHUNK1_TAIL_MARGIN_TOKENS = 3
+                    margin_samples = CHUNK1_TAIL_MARGIN_TOKENS * SAMPLES_PER_SPEECH_TOKEN
+                    reliable_end = max(0, len(gen_audio_c1) - margin_samples)
+                    reliable = gen_audio_c1[:reliable_end]
+                    chunk1_audio_len = reliable_end
+
+                    # Emit everything except the last crossfade_samples of the
+                    # reliable region, which we hold back and blend with chunk 2.
+                    if len(reliable) > crossfade_samples:
+                        emit_now = reliable[:-crossfade_samples]
+                        held_back_tail = reliable[-crossfade_samples:]
+                    else:
+                        # Reliable audio shorter than crossfade window — emit
+                        # all, no crossfade.
+                        emit_now = reliable
+                        held_back_tail = None
+                    if t_first_emit is None:
+                        t_first_emit = time.perf_counter()
+                    yield _emit_pcm(emit_now), S3GEN_SR
+                    chunk1_emitted = True
+            else:
+                logger.warning(f"Hit max_new_tokens={max_new_tokens} without EOS")
+
+        # Strip BOS, EOS (if present) and prepend reference prompt tokens.
+        speech_tokens = generate_tokens[:, 1:]
+        if speech_tokens.size > 0 and speech_tokens[0, -1] == STOP_SPEECH_TOKEN:
+            speech_tokens = speech_tokens[:, :-1]
+        speech_tokens = np.concatenate([prompt_token, speech_tokens], axis=1)
+
+        lm_elapsed = time.perf_counter() - t_gen_start
+        logger.info(
+            f"Stream LM done: {speech_tokens.shape[1]} tokens in {steps_run} steps "
+            f"({lm_elapsed:.2f}s, {lm_elapsed/max(steps_run,1)*1000:.1f}ms/step)"
+        )
+
+        # Final vocoder pass on the full token sequence. Decoder already trims
+        # prompt audio — gen_audio_full is just the generated speech.
+        t_voc = time.perf_counter()
+        wav_full = _cond_decoder_session.run(None, {
+            "speech_tokens": speech_tokens,
+            "speaker_embeddings": ref_x_vector,
+            "speaker_features": prompt_feat,
+        })[0]
+        gen_audio_full = np.squeeze(wav_full, axis=0)
+        voc_elapsed = time.perf_counter() - t_voc
+
+        if chunk1_emitted and held_back_tail is not None and chunk1_audio_len is not None:
+            # Crossfade at the boundary. Chunk 1 emitted audio up to
+            # chunk1_audio_len - crossfade_samples; we held back the trailing
+            # crossfade_samples. Blend those with the corresponding region of
+            # chunk 2's output, then emit the rest of chunk 2.
+            boundary = chunk1_audio_len  # sample offset inside gen_audio_full
+            xfade_start = boundary - crossfade_samples
+            xfade_end = boundary
+            if xfade_start < 0 or xfade_end > len(gen_audio_full):
+                # Shouldn't happen; fall back to plain emission of new tail only.
+                logger.warning("Crossfade window out of range — emitting hard boundary")
+                yield _emit_pcm(held_back_tail), S3GEN_SR
+                yield _emit_pcm(gen_audio_full[boundary:]), S3GEN_SR
+            else:
+                head_b = gen_audio_full[xfade_start:xfade_end]
+                blended = _linear_crossfade(held_back_tail, head_b)
+                tail_rest = gen_audio_full[xfade_end:]
+                yield _emit_pcm(blended), S3GEN_SR
+                if len(tail_rest) > 0:
+                    yield _emit_pcm(tail_rest), S3GEN_SR
+        elif chunk1_emitted:
+            # Streamed chunk 1 but had no held_back (chunk shorter than crossfade
+            # window). Emit everything past chunk 1's end from chunk 2.
+            if chunk1_audio_len is not None:
+                tail_rest = gen_audio_full[chunk1_audio_len:]
+                if len(tail_rest) > 0:
+                    yield _emit_pcm(tail_rest), S3GEN_SR
+        else:
+            # Never streamed (utterance shorter than K1) — emit everything now.
+            if t_first_emit is None:
+                t_first_emit = time.perf_counter()
+            yield _emit_pcm(gen_audio_full), S3GEN_SR
+
+        total_elapsed = time.perf_counter() - t_gen_start
+        ttf = (t_first_emit - t_gen_start) if t_first_emit else total_elapsed
+        logger.info(
+            f"Stream done: ttf={ttf*1000:.0f}ms, vocoder={voc_elapsed*1000:.0f}ms, "
+            f"total={total_elapsed*1000:.0f}ms, chunks=2 (streamed={chunk1_emitted})"
+        )
+
+    except Exception as e:
+        logger.error(f"ONNX v2 stream synthesis error: {e}", exc_info=True)
+        return
 
 
 def unload_model() -> bool:
