@@ -991,6 +991,12 @@ async def custom_tts_endpoint(
                     if request.language is not None
                     else get_gen_default_language()
                 ),
+                # Best-of-N: honoured only when the engine supports it
+                # (ONNX engine does; PyTorch engine ignores the kwarg).
+                **({"n_candidates": request.n_candidates}
+                   if getattr(request, "n_candidates", None) is not None
+                   and "n_candidates" in engine.synthesize.__code__.co_varnames
+                   else {}),
             )
             perf_monitor.record(f"Engine synthesized chunk {i+1}")
 
