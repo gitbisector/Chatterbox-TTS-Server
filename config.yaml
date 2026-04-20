@@ -34,6 +34,29 @@ streaming:
   crossfade_ms: 30
   # Optional override: force a specific K1. Leave null to let the budget drive it.
   first_chunk_tokens_override: null
+denoise:
+  # Phase 2a: run the vocoder output through RNNoise to remove low-frequency
+  # rumble and high-frequency hiss. Pure-CPU, a few ms per second of audio on
+  # ARM. Streaming roundtrip quality stays at Phase-1 baseline or better.
+  enabled: true
+  # Only mode implemented today is rnnoise; kept for future extensibility.
+  mode: rnnoise
+
+# Phase 2b: best-of-N batched through the LM at batch=2N (adjacent cond/uncond
+# pairs per candidate), Whisper-scored, best picked. Only affects /tts.
+#
+# Default is N=1 — N=3 triples vocoder + Whisper cost, pushing /tts from ~1.7s
+# to 5-9s which is too slow for interactive use. Clients that want the quality
+# uplift can opt in per-request via the `n_candidates` field on CustomTTSRequest.
+n_candidates: 1
+candidate_validation_threshold: 0.70
+
+whisper:
+  # Reach the Whisper container via the host gateway — chatterbox sits on a
+  # different Docker network. 172.20.0.1 is `containers_default`'s gateway and
+  # forwards to the host port where whisper publishes 9001.
+  host: 172.20.0.1
+  port: 9001
 audio_output:
   format: wav
   sample_rate: 24000

@@ -29,7 +29,7 @@ import librosa
 import numpy as np
 import onnxruntime as ort
 import torch
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
 
 from config import config_manager
@@ -44,10 +44,6 @@ logger = logging.getLogger(__name__)
 
 # --- Constants ---
 COMMUNITY_REPO_ID = "onnx-community/chatterbox-multilingual-ONNX"
-# V2 export with CFG + alignment attention + streaming-friendly graphs,
-# published from this fork's services/chatterbox-onnx-export/ scripts.
-# Override with CHATTERBOX_ONNX_REPO env var if you fork the weights.
-V2_REPO_ID_DEFAULT = "hugbos/chatterbox-multilingual-ONNX-v2"
 S3GEN_SR = 24000
 START_SPEECH_TOKEN = 6561
 STOP_SPEECH_TOKEN = 6562
@@ -270,32 +266,16 @@ def load_model() -> bool:
             logger.warning(f"Unsupported CFM step count {_cfm_n}, falling back to 6")
             _cfm_n = 6
 
-        # Fetch v2 ONNX weights from HuggingFace on first boot. A persistent
-        # volume mounted at CHATTERBOX_ONNX_DIR (default /app/onnx-models)
-        # caches the download so subsequent starts are fast.
+        # Paths — v2 models live in /app/onnx-models (bind-mounted or baked in).
         v2_dir = Path(os.environ.get("CHATTERBOX_ONNX_DIR", "/app/onnx-models"))
-        v2_repo = os.environ.get("CHATTERBOX_ONNX_REPO", V2_REPO_ID_DEFAULT)
-        hf_token = os.getenv("HF_TOKEN")
+        if not v2_dir.exists():
+            raise RuntimeError(f"ONNX v2 model directory not found: {v2_dir}. "
+                               f"Mount your onnx-models folder there or set CHATTERBOX_ONNX_DIR.")
 
-        # Only the files we actually load — skip decoder variants we're not
-        # using to save ~550 MB of download per unused variant.
-        v2_patterns = [
-            "embed_tokens_v2.onnx", "embed_tokens_v2.onnx_data",
-            "language_model_v2.onnx", "language_model_v2.onnx_data",
-            f"conditional_decoder_n{_cfm_n}.onnx",
-            f"conditional_decoder_n{_cfm_n}.onnx_data",
-        ]
-        logger.info(f"Syncing v2 ONNX weights from {v2_repo} to {v2_dir} (CFM steps={_cfm_n})")
-        v2_dir.mkdir(parents=True, exist_ok=True)
-        snapshot_download(
-            repo_id=v2_repo,
-            repo_type="model",
-            local_dir=str(v2_dir),
-            allow_patterns=v2_patterns,
-            token=hf_token,
-        )
+        logger.info(f"Loading ONNX v2 models from {v2_dir} (CFM steps={_cfm_n})")
 
         # Download community assets (speech_encoder, tokenizer, cangjie, default voice)
+        hf_token = os.getenv("HF_TOKEN")
         cache_root = Path(config_manager.get_string("paths.model_cache", "./model_cache")) / "chatterbox-multilingual-onnx"
         for fname, subfolder in [
             ("speech_encoder.onnx", "onnx"),
@@ -489,6 +469,19 @@ def _present_to_past(out_dict: dict) -> dict:
     }
 
 
+def _attn_for_cand(attn_layers: np.ndarray, cand_idx: int = 0) -> np.ndarray:
+    """Return (3, H, S, total_S) from a language-model attn_layers output.
+
+    The Phase-1 export emitted shape (3, H, S, total_S) — a single candidate.
+    The Phase-2b export emits (3, N, H, S, total_S) and we slice out the
+    requested candidate. Handles both shapes so the engine keeps working
+    across graph versions.
+    """
+    if attn_layers.ndim == 5:  # (3, N, H, S, total_S)
+        return attn_layers[:, cand_idx]
+    return attn_layers  # already (3, H, S, total_S)
+
+
 # ---- Streaming helpers ---------------------------------------------------
 
 # Audio samples emitted per speech token at S3GEN_SR (25 Hz tokens × 960 samples = 24 kHz).
@@ -540,6 +533,403 @@ def _linear_crossfade(tail_a: np.ndarray, head_b: np.ndarray) -> np.ndarray:
     return tail_a[:n] * fade + head_b[:n] * (1.0 - fade)
 
 
+# ---- Denoiser (Phase 2a) -------------------------------------------------
+
+_rnnoise_sr = 48000       # RNNoise is trained at 48 kHz
+_rnnoise_available = None  # None=untested, True/False after first probe
+
+
+def _rnnoise_can_load() -> bool:
+    """One-time probe: is pyrnnoise importable?"""
+    global _rnnoise_available
+    if _rnnoise_available is not None:
+        return _rnnoise_available
+    try:
+        import pyrnnoise  # noqa: F401
+        _rnnoise_available = True
+        logger.info("pyrnnoise available — denoise path enabled")
+    except ImportError:
+        _rnnoise_available = False
+        logger.info("pyrnnoise not installed — denoise disabled")
+    return _rnnoise_available
+
+
+def new_rnnoise_denoiser():
+    """Construct a fresh RNNoise denoiser instance. Call once per synthesis
+    request to avoid cross-request state pollution (pyrnnoise.RNNoise keeps
+    temporal state across denoise_chunk calls). Returns None if pyrnnoise
+    isn't installed.
+    """
+    if not _rnnoise_can_load():
+        return None
+    import pyrnnoise
+    return pyrnnoise.RNNoise(_rnnoise_sr)
+
+
+def _simple_upsample_2x(wav: np.ndarray) -> np.ndarray:
+    """Zero-stuff + 2-tap linear interpolation = 2× upsample with crude
+    anti-aliasing. Fast (O(N), no FFT, no polyphase matrix) and memory-flat.
+    Good enough for RNNoise's frequency range — RNNoise itself is trained for
+    ~20 kHz bandwidth and doesn't care about perfect 24-48 kHz reconstruction.
+    """
+    n = wav.shape[0]
+    out = np.empty(2 * n, dtype=np.float32)
+    out[0::2] = wav
+    out[1::2] = np.concatenate([(wav[:-1] + wav[1:]) * 0.5, wav[-1:]])
+    return out
+
+
+def _simple_downsample_2x(wav: np.ndarray) -> np.ndarray:
+    """Anti-aliased 2× downsample: 2-tap moving average then decimate.
+    Matches the reverse of _simple_upsample_2x well enough that a round-trip
+    through RNNoise at 48 kHz preserves speech content at 24 kHz.
+    """
+    if wav.shape[0] < 2:
+        return wav[::2].astype(np.float32)
+    smoothed = np.empty_like(wav)
+    smoothed[0] = wav[0]
+    smoothed[1:] = (wav[:-1] + wav[1:]) * 0.5
+    return smoothed[::2].astype(np.float32)
+
+
+def _fft_resample(wav: np.ndarray, in_sr: int, out_sr: int) -> np.ndarray:
+    """FFT-based resample for non-2× ratios. O(N log N) memory + time."""
+    from scipy.signal import resample
+    new_len = int(round(len(wav) * out_sr / in_sr))
+    return resample(wav, new_len).astype(np.float32)
+
+
+def _denoise_rnnoise(wav: np.ndarray, denoiser, sr: int = S3GEN_SR) -> np.ndarray:
+    """Run a float32 [-1, 1] waveform through the given RNNoise denoiser.
+
+    Resamples to 48 kHz, converts to int16, runs RNNoise frame-by-frame, then
+    converts back. The denoiser keeps state across calls so streaming chunks
+    preserve continuity — pass the same `denoiser` instance for every chunk of
+    one utterance.
+
+    On ARM cores (Spark) this takes ~5–15 ms per second of audio.
+    """
+    if denoiser is None or wav.size == 0:
+        return wav
+
+    # Ensure 1-D float32 input (defensive — `resample_poly` blows up
+    # memory allocating a (N, filter_len) matrix if handed the wrong shape).
+    wav = np.asarray(wav, dtype=np.float32).ravel()
+    if wav.size == 0:
+        return wav
+
+    # Resample 24 kHz → 48 kHz. We use a simple linear-interpolation upsample
+    # (for 2× factor, just alternate sample + midpoint average). FIR-based
+    # resamplers blow up memory on long utterances with certain shapes, and
+    # the 2× upsample here is just a sample-rate-match for RNNoise — we don't
+    # need aggressive anti-aliasing because RNNoise operates in its own trained
+    # frequency range.
+    if sr != _rnnoise_sr:
+        wav_48 = _simple_upsample_2x(wav) if _rnnoise_sr == 2 * sr else _fft_resample(wav, sr, _rnnoise_sr)
+    else:
+        wav_48 = wav
+
+    # float32 [-1, 1] → int16 for pyrnnoise.
+    wav_i16 = (np.clip(wav_48, -1.0, 1.0) * 32767.0).astype(np.int16)
+
+    # denoise_chunk yields (vad_score, denoised_frame) tuples — each frame is
+    # shape (1, 480) int16 at 48 kHz. Concatenate frames along the sample axis.
+    # partial=True flushes the trailing short frame so sample counts add up.
+    try:
+        frames = [frame.ravel() for _vad, frame in denoiser.denoise_chunk(wav_i16, partial=True)]
+    except Exception as e:
+        logger.warning(f"RNNoise failed ({e}); returning raw audio")
+        return wav
+
+    if not frames:
+        return wav
+
+    out_48 = np.concatenate(frames).astype(np.float32) / 32767.0
+
+    # Resample back to original sr. 48 → 24 kHz = take every other sample
+    # after a simple 2-tap lowpass to suppress high-frequency aliases.
+    if sr != _rnnoise_sr:
+        out = _simple_downsample_2x(out_48) if _rnnoise_sr == 2 * sr else _fft_resample(out_48, _rnnoise_sr, sr)
+    else:
+        out = out_48
+
+    # RNNoise pads to 10 ms frames; pad/trim so the caller's sample-index
+    # bookkeeping (crossfade, etc.) still lines up.
+    if len(out) < len(wav):
+        out = np.pad(out, (0, len(wav) - len(out)))
+    elif len(out) > len(wav):
+        out = out[:len(wav)]
+    return out
+
+
+def _denoise_enabled() -> bool:
+    """Read the denoise.enabled config knob (default True)."""
+    return config_manager.get_bool("denoise.enabled", True)
+
+
+# ---- Best-of-N helpers (Phase 2b) ---------------------------------------
+
+def _whisper_score(wav_i16: bytes, reference_text: str, language: str,
+                   timeout_s: float = 15.0) -> float:
+    """POST a WAV to the local Whisper service and return difflib similarity
+    of the transcription vs ``reference_text``. Returns 0.0 on any error.
+    """
+    import difflib
+    import io
+    import re
+    import wave
+    import urllib.request
+
+    try:
+        # Wrap PCM bytes in a WAV container.
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(S3GEN_SR)
+            w.writeframes(wav_i16)
+        wav_bytes = buf.getvalue()
+
+        host = config_manager.get_string("whisper.host", "localhost")
+        port = config_manager.get_int("whisper.port", 9001)
+        url = f"http://{host}:{port}/asr?task=transcribe&language={language}&output=txt"
+
+        # multipart/form-data for the POST.
+        boundary = "----candidateform"
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="audio_file"; filename="c.wav"\r\n'
+            f"Content-Type: audio/wav\r\n\r\n"
+        ).encode() + wav_bytes + f"\r\n--{boundary}--\r\n".encode()
+        req = urllib.request.Request(
+            url, data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            heard = resp.read().decode("utf-8", errors="replace").strip()
+
+        def norm(s: str) -> str:
+            s = s.lower()
+            s = re.sub(r"[^\w\s]", " ", s, flags=re.UNICODE)
+            return re.sub(r"\s+", " ", s).strip()
+
+        return difflib.SequenceMatcher(None, norm(reference_text), norm(heard)).ratio()
+    except Exception as e:
+        logger.warning(f"Whisper validation failed: {e}")
+        return 0.0
+
+
+def _synthesize_batched_bestof_n(
+    text: str,
+    audio_prompt_path: Optional[str],
+    temperature: float,
+    exaggeration: float,
+    cfg_weight: float,
+    seed: int,
+    language: str,
+    n_candidates: int,
+) -> Tuple[Optional[torch.Tensor], Optional[int]]:
+    """Run N candidates through the LM in one batched decode loop (batch=2N
+    pairs (cond, uncond) per candidate), vocode + denoise each, Whisper-score
+    them, and return the best waveform.
+
+    Requires the Phase-2b re-exported ``language_model_v2.onnx`` with
+    batch-dynamic CFG combine. N=1 still works but is pointless here —
+    ``synthesize()`` should dispatch to the non-batched path for n=1.
+    """
+    if seed != 0:
+        set_seed(seed)
+
+    lang = language.lower() if language else "en"
+    if lang not in SUPPORTED_LANGUAGES:
+        lang = "en"
+
+    # ---- Identical setup to synthesize() up to the prefill inputs. ----
+    voice_path = audio_prompt_path or str(_default_voice_path)
+    audio_values, _ = librosa.load(voice_path, sr=S3GEN_SR)
+    audio_values = audio_values[np.newaxis, :].astype(np.float32)
+
+    prepared_text = _prepare_language(text, lang)
+    input_ids = _tokenizer(prepared_text, return_tensors="np")["input_ids"].astype(np.int64)
+    position_ids = np.where(
+        input_ids >= START_SPEECH_TOKEN,
+        0,
+        np.arange(input_ids.shape[1])[np.newaxis, :] - 1,
+    ).astype(np.int64)
+
+    cond_emb_np, prompt_token, ref_x_vector, prompt_feat = _speech_encoder_session.run(
+        None, {"audio_values": audio_values}
+    )
+    cond_emb_b2 = np.broadcast_to(
+        cond_emb_np.astype(np.float16),
+        (2, cond_emb_np.shape[1], cond_emb_np.shape[2]),
+    ).copy()
+    cond_len = cond_emb_b2.shape[1]
+
+    bos_ids = np.array([[START_SPEECH_TOKEN]], dtype=np.int64)
+    input_ids_bos = np.concatenate([input_ids, bos_ids], axis=1)
+    position_ids_bos = np.concatenate(
+        [position_ids, np.array([[0]], dtype=np.int64)], axis=1
+    )
+    input_ids_b2 = np.concatenate([input_ids_bos, input_ids_bos], axis=0)
+    position_ids_b2 = np.concatenate([position_ids_bos, position_ids_bos], axis=0)
+    text_embeds = _embed_tokens_session.run(None, {
+        "input_ids": input_ids_b2,
+        "position_ids": position_ids_b2,
+        "exaggeration": np.array([exaggeration], dtype=np.float32),
+    })[0]
+    text_len = input_ids.shape[1]
+
+    prefill_embeds_b2 = np.concatenate([cond_emb_b2, text_embeds], axis=1)
+
+    # ---- Tile to batch=2N (adjacent (cond, uncond) pairs per candidate). ----
+    B = 2 * n_candidates
+    prefill_embeds = np.tile(prefill_embeds_b2, (n_candidates, 1, 1))
+    _, prefill_len, _ = prefill_embeds.shape
+    attention_mask = np.ones((B, prefill_len), dtype=np.int64)
+    past_kv = {
+        f"past_key_values.{l}.{kv}": np.zeros(
+            (B, NUM_KEY_VALUE_HEADS, 0, HEAD_DIM), dtype=np.float16
+        )
+        for l in range(NUM_HIDDEN_LAYERS) for kv in ("key", "value")
+    }
+    cfg_scalar = np.array(cfg_weight, dtype=np.float16)
+
+    max_new_tokens = config_manager.get_int("generation_defaults.max_tokens", 800)
+    t_gen_start = time.perf_counter()
+    rep_proc = RepetitionPenaltyLogitsProcessor(penalty=2.0)
+
+    # Per-candidate state
+    analyzers = [
+        AlignmentStreamAnalyzer(
+            text_tokens_slice=(cond_len, cond_len + text_len),
+            eos_idx=STOP_SPEECH_TOKEN,
+        ) for _ in range(n_candidates)
+    ]
+    gen_tokens = [
+        np.array([[START_SPEECH_TOKEN]], dtype=np.int64) for _ in range(n_candidates)
+    ]
+    eos_flags = [False] * n_candidates
+    last_token = [START_SPEECH_TOKEN] * n_candidates
+
+    logger.info(
+        f"Batched best-of-{n_candidates} gen start lang={lang} "
+        f"cond_len={cond_len} text_len={text_len}"
+    )
+
+    # ---- Prefill + first sample per candidate ----
+    out = _run_lm(prefill_embeds, attention_mask, cfg_scalar, past_kv)
+    past_kv = _present_to_past(out)
+    logits_full = out["logits"]           # (N, prefill_len, V) fp16
+    attn_5d = out["attn_layers"]          # (3, N, H, prefill_len, prefill_len)
+
+    for c in range(n_candidates):
+        logits_c = logits_full[c:c+1, -1, :].astype(np.float32)
+        logits_c = analyzers[c].step(logits_c, attn_5d[:, c], next_token=None)
+        nt_c = _sample(logits_c, gen_tokens[c], temperature, rep_proc)
+        gen_tokens[c] = np.concatenate([gen_tokens[c], nt_c], axis=-1)
+        tok = int(nt_c[0, 0])
+        last_token[c] = tok
+        if tok == STOP_SPEECH_TOKEN:
+            eos_flags[c] = True
+
+    # ---- Decode loop at batch=2N ----
+    for i in range(1, max_new_tokens):
+        if all(eos_flags):
+            break
+        # Per-candidate last-sampled token, duplicated for (cond, uncond) rows.
+        # Shape (2N, 1).
+        nt_b2n = np.array(
+            [[t] for t in last_token for _ in range(2)], dtype=np.int64
+        )
+        pos_ids_b2n = np.full((B, 1), i, dtype=np.int64)
+        step_embeds = _embed_tokens_session.run(None, {
+            "input_ids": nt_b2n,
+            "position_ids": pos_ids_b2n,
+            "exaggeration": np.array([exaggeration], dtype=np.float32),
+        })[0]  # (2N, 1, 1024)
+
+        attention_mask = np.concatenate(
+            [attention_mask, np.ones((B, 1), dtype=np.int64)], axis=1
+        )
+
+        out = _run_lm(step_embeds, attention_mask, cfg_scalar, past_kv)
+        past_kv = _present_to_past(out)
+        logits_full = out["logits"]                 # (N, 1, V)
+        attn_5d = out["attn_layers"]                # (3, N, H, 1, total_S)
+
+        for c in range(n_candidates):
+            if eos_flags[c]:
+                continue
+            logits_c = logits_full[c:c+1, -1, :].astype(np.float32)
+            logits_c = analyzers[c].step(
+                logits_c, attn_5d[:, c], next_token=last_token[c]
+            )
+            nt_c = _sample(logits_c, gen_tokens[c], temperature, rep_proc)
+            gen_tokens[c] = np.concatenate([gen_tokens[c], nt_c], axis=-1)
+            tok = int(nt_c[0, 0])
+            last_token[c] = tok
+            if tok == STOP_SPEECH_TOKEN:
+                eos_flags[c] = True
+
+    lm_elapsed = time.perf_counter() - t_gen_start
+    lens = [gen_tokens[c].shape[1] - 1 for c in range(n_candidates)]  # minus BOS
+    logger.info(
+        f"Batched LM done in {lm_elapsed:.2f}s, per-cand tokens={lens}, "
+        f"eos={eos_flags}"
+    )
+
+    # ---- Vocode each candidate (serial for now; vocoder batching is a
+    #      follow-up optimisation), denoise, transcribe, score. ----
+    candidates: list = []
+    for c in range(n_candidates):
+        speech_c = gen_tokens[c][:, 1:]  # strip BOS
+        if speech_c.size > 0 and speech_c[0, -1] == STOP_SPEECH_TOKEN:
+            speech_c = speech_c[:, :-1]
+        speech_c = np.concatenate([prompt_token, speech_c], axis=1)
+        wav_c = _cond_decoder_session.run(None, {
+            "speech_tokens": speech_c,
+            "speaker_embeddings": ref_x_vector,
+            "speaker_features": prompt_feat,
+        })[0]
+        wav_c = np.squeeze(wav_c, axis=0)
+        if _denoise_enabled():
+            d = new_rnnoise_denoiser()
+            if d is not None:
+                wav_c = _denoise_rnnoise(wav_c, d, sr=S3GEN_SR)
+        # PCM int16 bytes for Whisper
+        pcm = _emit_pcm(wav_c)
+        sim = _whisper_score(pcm, text, lang)
+        logger.info(f"  candidate {c}: {len(wav_c)/S3GEN_SR:.2f}s, sim={sim:.2%}")
+        candidates.append({"wav": wav_c, "sim": sim, "idx": c})
+
+    if not candidates:
+        logger.error("No candidates produced")
+        return None, None
+
+    # Pick highest similarity. If all below threshold, take the one with the
+    # longest audio (petermg's fallback — likely contains most content).
+    threshold = config_manager.get_float("candidate_validation_threshold", 0.70)
+    best = max(candidates, key=lambda c: c["sim"])
+    if best["sim"] < threshold:
+        logger.warning(
+            f"All candidates below threshold ({best['sim']:.2%} < {threshold:.2%}); "
+            "falling back to longest audio"
+        )
+        best = max(candidates, key=lambda c: len(c["wav"]))
+    logger.info(f"Best-of-{n_candidates}: chose idx={best['idx']} sim={best['sim']:.2%}")
+
+    wav = best["wav"]
+
+    # Apply watermark (skip when DISABLE_WATERMARK=1).
+    if _watermarker is not None and not os.environ.get("DISABLE_WATERMARK"):
+        with torch.no_grad():
+            wav = _watermarker.apply_watermark(wav, sample_rate=S3GEN_SR)
+
+    return torch.from_numpy(wav).unsqueeze(0).float(), S3GEN_SR
+
+
 def synthesize(
     text: str,
     audio_prompt_path: Optional[str] = None,
@@ -548,10 +938,27 @@ def synthesize(
     cfg_weight: float = 0.5,
     seed: int = 0,
     language: str = "en",
+    n_candidates: Optional[int] = None,
 ) -> Tuple[Optional[torch.Tensor], Optional[int]]:
     if not MODEL_LOADED:
         logger.error("ONNX v2 TTS model is not loaded.")
         return None, None
+
+    # Resolve candidate count: caller-supplied, or config default.
+    if n_candidates is None:
+        n_candidates = config_manager.get_int("n_candidates", 1)
+    n_candidates = max(1, int(n_candidates))
+    if n_candidates > 1:
+        return _synthesize_batched_bestof_n(
+            text=text,
+            audio_prompt_path=audio_prompt_path,
+            temperature=temperature,
+            exaggeration=exaggeration,
+            cfg_weight=cfg_weight,
+            seed=seed,
+            language=language,
+            n_candidates=n_candidates,
+        )
 
     try:
         if seed != 0:
@@ -634,7 +1041,7 @@ def synthesize(
         # ===== Prefill =====
         out = _run_lm(prefill_embeds, attention_mask, cfg_scalar, past_kv)
         logits_full = out["logits"]  # (1, prefill_len, V) fp16
-        attn_layers = out["attn_layers"]  # (3, 16, prefill_len, prefill_len) fp32
+        attn_layers = _attn_for_cand(out["attn_layers"])  # (3, H, S, total_S) fp32
         past_kv = _present_to_past(out)
 
         # Take logits at the last position (the BOS-equivalent / start of speech)
@@ -662,7 +1069,7 @@ def synthesize(
 
                 out = _run_lm(step_embeds, attention_mask, cfg_scalar, past_kv)
                 logits_step = out["logits"][:, -1, :].astype(np.float32)
-                attn_layers = out["attn_layers"]
+                attn_layers = _attn_for_cand(out["attn_layers"])
                 past_kv = _present_to_past(out)
 
                 logits_step = analyzer.step(logits_step, attn_layers, next_token=int(next_token[0, 0]))
@@ -696,6 +1103,13 @@ def synthesize(
             "speaker_features": prompt_feat,
         })[0]
         wav = np.squeeze(wav, axis=0)
+
+        # Phase 2a: RNNoise post-pass removes vocoder artefacts (low-freq
+        # rumble, high-freq hiss). Single denoiser for the full utterance.
+        if _denoise_enabled():
+            denoiser = new_rnnoise_denoiser()
+            if denoiser is not None:
+                wav = _denoise_rnnoise(wav, denoiser, sr=S3GEN_SR)
 
         # Apply watermark using the shared watermarker (created once at load).
         # Set DISABLE_WATERMARK=1 to bypass (used for leak diagnosis).
@@ -764,6 +1178,22 @@ def synthesize_stream(
             k1 = _compute_first_chunk_tokens(budget)
         logger.info(f"Streaming config: K1={k1} tokens (~{k1/25.0:.2f} s audio)")
 
+        # Phase 2a: RNNoise post-pass. Use a FRESH denoiser per vocoder output
+        # (not per emitted sub-chunk) so that sample boundaries inside one
+        # vocoder output stay continuous, and the two vocoder passes (chunk 1
+        # and chunk 2) each get their own clean state. Matters for the
+        # crossfade: denoising each vocoder output independently keeps content
+        # at matching sample positions filter-aligned between chunk1 and chunk2.
+        denoise_on = _denoise_enabled()
+
+        def _denoise_full_wav(w: np.ndarray) -> np.ndarray:
+            if not denoise_on or w.size == 0:
+                return w
+            d = new_rnnoise_denoiser()
+            if d is None:
+                return w
+            return _denoise_rnnoise(w, d, sr=S3GEN_SR)
+
         # ---- Identical setup to synthesize() up to the decode loop. ----
         voice_path = audio_prompt_path or str(_default_voice_path)
         audio_values, _ = librosa.load(voice_path, sr=S3GEN_SR)
@@ -828,7 +1258,7 @@ def synthesize_stream(
         out = _run_lm(prefill_embeds, attention_mask, cfg_scalar, past_kv)
         past_kv = _present_to_past(out)
         logits_step = out["logits"][:, -1, :].astype(np.float32)
-        logits_step = analyzer.step(logits_step, out["attn_layers"], next_token=None)
+        logits_step = analyzer.step(logits_step, _attn_for_cand(out["attn_layers"]), next_token=None)
         next_token = _sample(logits_step, generate_tokens, temperature, rep_proc)
         generate_tokens = np.concatenate([generate_tokens, next_token], axis=-1)
 
@@ -854,7 +1284,7 @@ def synthesize_stream(
                 out = _run_lm(step_embeds, attention_mask, cfg_scalar, past_kv)
                 past_kv = _present_to_past(out)
                 logits_step = out["logits"][:, -1, :].astype(np.float32)
-                logits_step = analyzer.step(logits_step, out["attn_layers"], next_token=int(next_token[0, 0]))
+                logits_step = analyzer.step(logits_step, _attn_for_cand(out["attn_layers"]), next_token=int(next_token[0, 0]))
                 next_token = _sample(logits_step, generate_tokens, temperature, rep_proc)
                 generate_tokens = np.concatenate([generate_tokens, next_token], axis=-1)
                 steps_run += 1
@@ -877,6 +1307,10 @@ def synthesize_stream(
                     # Decoder already trims prompt audio internally — wav_c1 is
                     # just the generated speech.
                     gen_audio_c1 = np.squeeze(wav_c1, axis=0)
+                    # Denoise the full chunk-1 waveform BEFORE slicing into
+                    # reliable / held_back / emit regions so the splits stay
+                    # aligned (RNNoise is stateful across frames within one call).
+                    gen_audio_c1 = _denoise_full_wav(gen_audio_c1)
 
                     # Discard chunk 1's last CHUNK1_TAIL_MARGIN_TOKENS worth of
                     # audio: the vocoder generated those without future context
@@ -926,6 +1360,10 @@ def synthesize_stream(
             "speaker_features": prompt_feat,
         })[0]
         gen_audio_full = np.squeeze(wav_full, axis=0)
+        # Phase 2a: denoise the full chunk-2 waveform before crossfade math
+        # (fresh denoiser state matches chunk-1's fresh state so corresponding
+        # sample positions stay filter-aligned).
+        gen_audio_full = _denoise_full_wav(gen_audio_full)
         voc_elapsed = time.perf_counter() - t_voc
 
         if chunk1_emitted and held_back_tail is not None and chunk1_audio_len is not None:

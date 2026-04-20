@@ -60,10 +60,50 @@ class AlignmentStreamAnalyzer:
     MAX_STEPS_PER_TEXT_TOKEN = 25
     # Absolute floor for short inputs — don't over-truncate on "Hi." either.
     MIN_HARD_CAP = 150
+    # Defaults tuned for the EN/NL production target.
+    # - `complete_tolerance` matches upstream (3) to avoid cutting English
+    #   utterances short.
+    # - `long_tail` / `align_rep` thresholds dropped from upstream 5 → 4 so
+    #   Dutch's weaker attention peaks still trip the hallucination detectors
+    #   before running out to the token-rep fallback. English's peaks are
+    #   sharp so 4 doesn't cause premature firing.
+    # - `max_frames_past_complete=15` (~600 ms of audio past completion) is
+    #   the time-based safety net for cases where attention is so weak the
+    #   sum-based detectors never trip.
+    DEFAULT_COMPLETE_TOLERANCE = 3
+    DEFAULT_LONG_TAIL_THRESHOLD = 4.0
+    DEFAULT_ALIGN_REP_THRESHOLD = 4.0
+    DEFAULT_MAX_FRAMES_PAST_COMPLETE = 15
 
-    def __init__(self, text_tokens_slice: tuple[int, int], eos_idx: int):
+    def __init__(
+        self,
+        text_tokens_slice: tuple[int, int],
+        eos_idx: int,
+        complete_tolerance: Optional[int] = None,
+        long_tail_threshold: Optional[float] = None,
+        align_rep_threshold: Optional[float] = None,
+        max_frames_past_complete: Optional[int] = None,
+    ):
         self.text_tokens_slice = (i, j) = text_tokens_slice
         self.eos_idx = eos_idx
+
+        # Analyzer knobs — caller can override per-request (e.g. language-specific).
+        self.complete_tolerance = (
+            complete_tolerance if complete_tolerance is not None
+            else self.DEFAULT_COMPLETE_TOLERANCE
+        )
+        self.long_tail_threshold = (
+            long_tail_threshold if long_tail_threshold is not None
+            else self.DEFAULT_LONG_TAIL_THRESHOLD
+        )
+        self.align_rep_threshold = (
+            align_rep_threshold if align_rep_threshold is not None
+            else self.DEFAULT_ALIGN_REP_THRESHOLD
+        )
+        self.max_frames_past_complete = (
+            max_frames_past_complete if max_frames_past_complete is not None
+            else self.DEFAULT_MAX_FRAMES_PAST_COMPLETE
+        )
 
         self.alignment = np.zeros((0, j - i), dtype=np.float32)
         self.curr_frame_pos = 0
@@ -142,21 +182,38 @@ class AlignmentStreamAnalyzer:
         if self.started and self.started_at is None:
             self.started_at = T
 
-        # Completion check
-        self.complete = self.complete or self.text_position >= S - 3
+        # Completion check. `complete_tolerance` controls how close to the end
+        # of the text span counts as "done". Default tolerance=2 is tighter
+        # than upstream's 3 — helps non-English languages whose attention
+        # peaks less sharply but still reaches the end.
+        self.complete = (
+            self.complete or self.text_position >= S - self.complete_tolerance
+        )
         if self.complete and self.completed_at is None:
             self.completed_at = T
 
-        # Long-tail detection
+        # Long-tail detection: after "complete", if the attention on any of
+        # the last 3 text positions keeps summing over post-completion frames
+        # past the threshold, force EOS.
         long_tail = self.complete and (
             self.completed_at is not None and
-            A[self.completed_at:, -3:].sum(axis=0).max() >= 5
+            A[self.completed_at:, -3:].sum(axis=0).max() >= self.long_tail_threshold
         )
 
-        # Repetition via alignment
+        # Repetition via alignment: attention wandering backward after completion.
         alignment_repetition = self.complete and (
             self.completed_at is not None and
-            A[self.completed_at:, :-5].max(axis=1).sum() > 5
+            A[self.completed_at:, :-5].max(axis=1).sum() > self.align_rep_threshold
+        )
+
+        # Time-based post-completion force-EOS: even if attention scores stay
+        # below the long_tail / alignment_rep thresholds (which happens on
+        # languages with weaker attention peaks — Dutch is the reported
+        # outlier), don't wait forever for one of them to trigger.
+        post_completion_timeout = (
+            self.complete
+            and self.completed_at is not None
+            and (T - self.completed_at) > self.max_frames_past_complete
         )
 
         # Token-level repetition (3 of same token in a row)
@@ -181,16 +238,19 @@ class AlignmentStreamAnalyzer:
         hard_cap_hit = self.curr_frame_pos >= self.hard_step_cap
 
         # Suppress EOS until we've reached the end of text — but NEVER when the hard
-        # cap has fired, otherwise we can't force-terminate.
-        if not hard_cap_hit and cur_text_posn < S - 3 and S > 5:
+        # cap has fired, otherwise we can't force-terminate. Also respect the
+        # caller-configured completion tolerance.
+        if not hard_cap_hit and cur_text_posn < S - self.complete_tolerance and S > 5:
             logits = logits.copy()
             logits[..., self.eos_idx] = -(2 ** 15)
 
-        # Force EOS on bad-ending detection or hard cap
-        if long_tail or alignment_repetition or token_repetition or hard_cap_hit:
+        # Force EOS on bad-ending detection, post-completion timeout, or hard cap.
+        if (long_tail or alignment_repetition or token_repetition
+                or hard_cap_hit or post_completion_timeout):
             logger.warning(
                 f"forcing EOS at step {self.curr_frame_pos}, long_tail={long_tail} "
                 f"alignment_rep={alignment_repetition} token_rep={token_repetition} "
+                f"post_complete_timeout={post_completion_timeout} "
                 f"hard_cap={hard_cap_hit} (cap={self.hard_step_cap})"
             )
             logits = -(2 ** 15) * np.ones_like(logits)
