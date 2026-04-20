@@ -29,7 +29,7 @@ import librosa
 import numpy as np
 import onnxruntime as ort
 import torch
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, snapshot_download
 from transformers import AutoTokenizer
 
 from config import config_manager
@@ -44,6 +44,10 @@ logger = logging.getLogger(__name__)
 
 # --- Constants ---
 COMMUNITY_REPO_ID = "onnx-community/chatterbox-multilingual-ONNX"
+# V2 export with CFG + alignment attention + streaming-friendly graphs,
+# published from this fork's services/chatterbox-onnx-export/ scripts.
+# Override with CHATTERBOX_ONNX_REPO env var if you fork the weights.
+V2_REPO_ID_DEFAULT = "hugbos/chatterbox-multilingual-ONNX-v2"
 S3GEN_SR = 24000
 START_SPEECH_TOKEN = 6561
 STOP_SPEECH_TOKEN = 6562
@@ -266,16 +270,32 @@ def load_model() -> bool:
             logger.warning(f"Unsupported CFM step count {_cfm_n}, falling back to 6")
             _cfm_n = 6
 
-        # Paths — v2 models live in /app/onnx-models (bind-mounted or baked in).
+        # Fetch v2 ONNX weights from HuggingFace on first boot. A persistent
+        # volume mounted at CHATTERBOX_ONNX_DIR (default /app/onnx-models)
+        # caches the download so subsequent starts are fast.
         v2_dir = Path(os.environ.get("CHATTERBOX_ONNX_DIR", "/app/onnx-models"))
-        if not v2_dir.exists():
-            raise RuntimeError(f"ONNX v2 model directory not found: {v2_dir}. "
-                               f"Mount your onnx-models folder there or set CHATTERBOX_ONNX_DIR.")
+        v2_repo = os.environ.get("CHATTERBOX_ONNX_REPO", V2_REPO_ID_DEFAULT)
+        hf_token = os.getenv("HF_TOKEN")
 
-        logger.info(f"Loading ONNX v2 models from {v2_dir} (CFM steps={_cfm_n})")
+        # Only the files we actually load — skip decoder variants we're not
+        # using to save ~550 MB of download per unused variant.
+        v2_patterns = [
+            "embed_tokens_v2.onnx", "embed_tokens_v2.onnx_data",
+            "language_model_v2.onnx", "language_model_v2.onnx_data",
+            f"conditional_decoder_n{_cfm_n}.onnx",
+            f"conditional_decoder_n{_cfm_n}.onnx_data",
+        ]
+        logger.info(f"Syncing v2 ONNX weights from {v2_repo} to {v2_dir} (CFM steps={_cfm_n})")
+        v2_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_download(
+            repo_id=v2_repo,
+            repo_type="model",
+            local_dir=str(v2_dir),
+            allow_patterns=v2_patterns,
+            token=hf_token,
+        )
 
         # Download community assets (speech_encoder, tokenizer, cangjie, default voice)
-        hf_token = os.getenv("HF_TOKEN")
         cache_root = Path(config_manager.get_string("paths.model_cache", "./model_cache")) / "chatterbox-multilingual-onnx"
         for fname, subfolder in [
             ("speech_encoder.onnx", "onnx"),

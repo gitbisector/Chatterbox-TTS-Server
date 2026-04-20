@@ -32,6 +32,40 @@ This server is based on the architecture and UI of our [Dia-TTS-Server](https://
 
 ## 🆕 What's New
 
+### 🛰️ Streaming ONNX engine for DGX Spark / aarch64 + CUDA 13 (fork-only)
+
+This fork adds a second TTS backend selectable via `CHATTERBOX_ENGINE=onnx`.
+It runs Chatterbox Multilingual via ONNX Runtime with three functional
+upgrades over the existing community export at
+[onnx-community/chatterbox-multilingual-ONNX](https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX):
+classifier-free guidance baked into the language-model graph, alignment
+attention exposed (layers 9/12/13, consumed by a numpy `AlignmentStreamAnalyzer`
+to force EOS and fix the hallucinations reported in
+[resemble-ai/chatterbox#97](https://github.com/resemble-ai/chatterbox/issues/97)),
+and scatter-free graphs so ORT can CUDA-graph-capture the decode loop.
+
+On top of that, a `/tts/stream` endpoint streams audio as PCM over chunked
+HTTP with **time-to-first-audio ≈ 610 ms** (down from ~1680 ms one-shot),
+sized by real-time multiplier rather than a fixed constant so prosody
+stays intact — see `engine_onnx._compute_first_chunk_tokens`. All 6 of the
+streaming roundtrip test's languages (en/nl/de/fr/es/it) pass on a warm
+DGX Spark.
+
+Build with `docker build -f Dockerfile.spark-onnx -t chatterbox-onnx:latest .`
+(includes a multi-stage build of onnxruntime-gpu 1.24 from source for
+aarch64 + sm_121). ONNX weights are pulled from
+[hugbos/chatterbox-multilingual-ONNX-v2](https://huggingface.co/hugbos/chatterbox-multilingual-ONNX-v2)
+at first boot into a persistent volume, no model files in git.
+
+Testing:
+
+```bash
+python3 tests/tts_stt_streaming_roundtrip.py --ttfa-budget-ms 1000
+```
+
+Export code for regenerating the ONNX files lives in
+[chatterbox_onnx_conversion_scripts](https://github.com/gitbisector/chatterbox_onnx_conversion_scripts).
+
 ### 📦 Portable Mode for Windows (new)
 
 - The launcher now offers **Portable Mode** for all Windows users during first-time setup — selected by default.
