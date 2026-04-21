@@ -1,5 +1,11 @@
 # Chatterbox TTS Server: OpenAI-Compatible API with Web UI, Large Text Handling & Built-in Voices
 
+> **Fork note — DGX Spark (GB10, aarch64, CUDA 13):** this fork adds an ONNX
+> inference path with a rolling N-chunk streaming vocoder, batched best-of-N
+> streaming, CFM-6 default, and a Dockerfile targeting Blackwell SM 12.1.
+> For fork-specific feature list, deployment notes, and new config knobs see
+> **[SPARK.md](SPARK.md)**.
+
 **Self-host Resemble AI's [Chatterbox](https://github.com/resemble-ai/chatterbox) open-source TTS family (Original + Multilingual + Turbo) behind an OpenAI‑compatible API and a modern Web UI. The complete lineup includes the original high-quality model, multilingual support for 23 languages, and Chatterbox‑Turbo—a streamlined 350M-parameter model with dramatically improved throughput and native paralinguistic tags like `[laugh]`, `[cough]`, and `[chuckle]` for more expressive voice agents and narration. Features voice cloning, large text processing via intelligent chunking, audiobook generation, and consistent, reproducible voices using built-in ready-to-use voices and a generation seed feature.**
 
 > 🚀 **Try it now!** Test the full TTS server with voice cloning and audiobook generation in Google Colab - no installation required! To use it, please run cells 1 through 4 one at a time. After running cell 4, click on the "https://localhost:8004" link that appears in the output, and your web browser will open the UI from the .colab.dev domain. Read the instructions [here](https://github.com/devnen/Chatterbox-TTS-Server/blob/main/README_Colab.md).
