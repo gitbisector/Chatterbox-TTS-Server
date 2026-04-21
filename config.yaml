@@ -17,7 +17,10 @@ tts_engine:
   predefined_voices_path: voices
   reference_audio_path: reference_audio
   default_voice_id: Emily.wav
-  onnx_cfm_steps: 4
+  # CFM-4 emits chaotic near-Nyquist noise in transition regions (audible as
+  # crackles that denoise can only partially hide). CFM-6 adds ~50% per-vocode
+  # wall-time but produces clean speech without relying on RNNoise.
+  onnx_cfm_steps: 6
   # LM forward-pass backend. "ort" = fp16 ONNX via onnxruntime (default;
   # matches pre-Phase-2d behaviour). "trt" = INT8 TensorRT engine via
   # engine_trt_lm — ~2x faster decode on Blackwell, requires tensorrt +
@@ -46,10 +49,16 @@ streaming:
   # from this using measured LM step + vocoder cost. 800 ms is a conservative
   # default on DGX Spark (K1 ~= 40 tokens ~= 1.6 s of audio).
   first_chunk_budget_ms: 800
-  # Crossfade (ms) at the chunk1/chunk2 boundary to mask CFM noise differences.
+  # Crossfade (ms) at every rolling chunk boundary to mask CFM noise differences.
   crossfade_ms: 30
   # Optional override: force a specific K1. Leave null to let the budget drive it.
   first_chunk_tokens_override: null
+  # Rolling vocode cadence: fire the vocoder again every N generated tokens
+  # after the first chunk. 0 / null means "use the same K1 as the first chunk"
+  # which gives predictable audio-duration-per-chunk (~K/25 s). Lower values
+  # cut buffer underrun risk on long utterances; higher values cut total
+  # vocode wall-time. Default 0 = K1.
+  rolling_chunk_tokens: 0
 denoise:
   # Phase 2a: run the vocoder output through RNNoise to remove low-frequency
   # rumble and high-frequency hiss. Pure-CPU, a few ms per second of audio on
@@ -57,7 +66,13 @@ denoise:
   # 10 ms at 48 kHz. 2× resample is done in ~3-tap linear-interpolation to
   # keep memory flat (scipy's FIR designs blow up on long arrays in some
   # edge cases).
-  enabled: true
+  # Disabled 2026-04-20: with the rolling-vocoder refactor firing the denoiser
+  # many times per utterance (fresh state each call), the ~3-tap resampler
+  # introduces full-scale click/crackle transients at ~10 Hz intervals through
+  # each chunk. Re-enable once the denoise path is reworked to process only
+  # the new region of each vocode (O(length) instead of O(length^2)) AND the
+  # resampler boundary behaviour is audited.
+  enabled: false
   # Only mode implemented today is rnnoise; kept for future extensibility.
   mode: rnnoise
 

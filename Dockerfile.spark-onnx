@@ -90,7 +90,8 @@ RUN pip3 install --no-cache-dir \
     resemble-perth==1.0.1 \
     tqdm \
     jinja2 \
-    python-multipart
+    python-multipart \
+    pyrnnoise==0.4.3
 
 # TensorRT + CUDA Python bindings for the TRT LM backend (engine_trt_lm.py).
 # The .post1 variants are the ones PyPI actually ships bindings for at

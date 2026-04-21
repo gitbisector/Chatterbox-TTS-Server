@@ -1327,6 +1327,597 @@ def synthesize(
         return None, None
 
 
+# Tokens of audio discarded from the right edge of every non-final rolling
+# vocode call — the CFM vocoder has no future context past the last token and
+# the rightmost samples contain attack artifacts (dropped consonants, flutter).
+# The next rolling vocode re-synthesises them with extra future context.
+CHUNK_TAIL_MARGIN_TOKENS = 3
+
+
+def _strip_trailing_repeat(speech_tokens: np.ndarray,
+                           max_strip: int = 6) -> np.ndarray:
+    """Trim the tail audible-token repetition that fires right before
+    ``alignment_runtime`` force-EOSes on `token_rep=True`.
+
+    The alignment analyzer needs TWO identical consecutive tokens to decide
+    the model has looped, so by the time it pushes EOS into the logits the
+    repeated pair is already committed to ``generate_tokens``.  Without this
+    trim the final vocode renders an audible "syllable echo" at the end of
+    the utterance (user-reported as "X repeating himself at end").
+
+    We scan backward from the tail and drop tokens that equal their
+    predecessor, capped at ``max_strip`` so a legitimate repeated phoneme
+    survives.  Called ONLY on the final vocode — intermediate rolling
+    vocodes may still see transient repeats before the model recovers.
+    """
+    if speech_tokens.size < 2:
+        return speech_tokens
+    tail = speech_tokens[0]
+    stripped = 0
+    while stripped < max_strip and tail.shape[0] >= 2 and tail[-1] == tail[-2]:
+        tail = tail[:-1]
+        stripped += 1
+    if stripped > 0:
+        logger.info(
+            f"trimmed {stripped} repeated trailing speech token(s) before "
+            f"final vocode (tok={int(speech_tokens[0, -1])})"
+        )
+    return tail[np.newaxis, :] if stripped > 0 else speech_tokens
+
+
+class _RollingStreamState:
+    """Rolling-vocode emit bookkeeping shared by single-candidate and
+    best-of-N streaming paths.
+
+    Holds ``committed_samples`` (absolute sample offset of what we've already
+    emitted to the client) and ``held_back_tail`` (the trailing crossfade_ms
+    of the most recent vocode, to be blended with the matching region of the
+    next vocode).  Each call to ``emit_from_wav`` yields PCM chunks for the
+    newly-committed audio and updates the state.
+
+    The n=1 path uses ``emit_with_vocode`` which vocodes tokens internally.
+    The n>1 path vocodes candidates up-front (to pick a winner) and calls
+    ``emit_from_wav`` directly with the winner's wav so no redundant vocode
+    is run.
+    """
+
+    def __init__(self, prompt_token, ref_x_vector, prompt_feat,
+                 crossfade_samples, tail_margin_samples, denoise_full_wav):
+        self.prompt_token = prompt_token
+        self.ref_x_vector = ref_x_vector
+        self.prompt_feat = prompt_feat
+        self.crossfade_samples = crossfade_samples
+        self.tail_margin_samples = tail_margin_samples
+        self._denoise = denoise_full_wav
+
+        self.committed_samples = 0
+        self.held_back_tail: Optional[np.ndarray] = None
+        self.rolling_vocodes = 0   # non-final vocodes fired
+        self.voc_elapsed_total = 0.0
+        self.t_first_emit: Optional[float] = None
+
+    def vocode(self, generate_tokens, is_final: bool) -> np.ndarray:
+        """Run cond_decoder on ``[prompt | generate_tokens[:,1:]]`` (stripping
+        the BOS seed and, on is_final=True, a trailing EOS plus any
+        alignment-runtime repetition tail).  Returns the full denoised
+        waveform."""
+        speech = generate_tokens[:, 1:]
+        if is_final and speech.size > 0 and speech[0, -1] == STOP_SPEECH_TOKEN:
+            speech = speech[:, :-1]
+        if is_final:
+            speech = _strip_trailing_repeat(speech)
+        seq = np.concatenate([self.prompt_token, speech], axis=1)
+        t_voc = time.perf_counter()
+        wav = _cond_decoder_session.run(None, {
+            "speech_tokens": seq,
+            "speaker_embeddings": self.ref_x_vector,
+            "speaker_features": self.prompt_feat,
+        })[0]
+        wav = np.squeeze(wav, axis=0)
+        wav = self._denoise(wav)
+        self.voc_elapsed_total += time.perf_counter() - t_voc
+        return wav
+
+    def emit_from_wav(self, wav: np.ndarray, is_final: bool):
+        """Advance the rolling state using a pre-computed vocode output and
+        yield (pcm_bytes, sr) tuples for the newly committed audio."""
+        total_len = len(wav)
+        reliable_end = total_len if is_final else max(
+            0, total_len - self.tail_margin_samples
+        )
+
+        # Case 1: first emit (no prior committed audio).
+        if self.committed_samples == 0 and self.held_back_tail is None:
+            if is_final or reliable_end <= self.crossfade_samples:
+                if self.t_first_emit is None:
+                    self.t_first_emit = time.perf_counter()
+                yield _emit_pcm(wav[:reliable_end]), S3GEN_SR
+                self.committed_samples = reliable_end
+                self.held_back_tail = None
+                return
+            body_end = reliable_end - self.crossfade_samples
+            if self.t_first_emit is None:
+                self.t_first_emit = time.perf_counter()
+            yield _emit_pcm(wav[:body_end]), S3GEN_SR
+            self.committed_samples = body_end
+            self.held_back_tail = wav[body_end:reliable_end].copy()
+            return
+
+        # Case 2: subsequent emit.
+        if self.held_back_tail is None:
+            logger.warning(
+                "rolling vocode: held_back_tail missing on subsequent "
+                "emit; emitting hard boundary"
+            )
+            tail = wav[self.committed_samples:reliable_end]
+            if len(tail) > 0:
+                yield _emit_pcm(tail), S3GEN_SR
+                self.committed_samples += len(tail)
+            return
+
+        xfade_end = self.committed_samples + len(self.held_back_tail)
+        if xfade_end > total_len:
+            logger.warning(
+                f"rolling vocode: xfade_end={xfade_end} > "
+                f"new_vocode_len={total_len}; emitting hard boundary"
+            )
+            yield _emit_pcm(self.held_back_tail), S3GEN_SR
+            self.committed_samples = xfade_end
+            self.held_back_tail = None
+            return
+
+        head_b = wav[self.committed_samples:xfade_end]
+        blended = _linear_crossfade(self.held_back_tail, head_b)
+        yield _emit_pcm(blended), S3GEN_SR
+        self.committed_samples = xfade_end
+        self.held_back_tail = None
+
+        if is_final:
+            tail = wav[self.committed_samples:reliable_end]
+            if len(tail) > 0:
+                yield _emit_pcm(tail), S3GEN_SR
+                self.committed_samples += len(tail)
+            return
+
+        body_end = reliable_end - self.crossfade_samples
+        if body_end > self.committed_samples:
+            yield _emit_pcm(wav[self.committed_samples:body_end]), S3GEN_SR
+            self.committed_samples = body_end
+            self.held_back_tail = wav[body_end:reliable_end].copy()
+        else:
+            remain = wav[self.committed_samples:reliable_end]
+            self.held_back_tail = remain.copy() if len(remain) > 0 else None
+            logger.warning(
+                "rolling vocode: <crossfade new audio past boundary; "
+                "next crossfade may be short"
+            )
+
+    def emit_with_vocode(self, generate_tokens, is_final: bool):
+        """Convenience: vocode then emit. Used by the n=1 path."""
+        wav = self.vocode(generate_tokens, is_final)
+        yield from self.emit_from_wav(wav, is_final)
+
+
+def _score_partial_candidate(wav: np.ndarray, reference_text: str,
+                             language: str) -> float:
+    """Score a partial chunk-1 candidate waveform against the reference
+    text via the selection STT service (Parakeet). We reuse the same
+    ``_whisper_score`` call used by batched best-of-N, with the wav cut to
+    int16 PCM bytes; Parakeet happily transcribes partial phrases.
+
+    Returns the difflib similarity ratio of the transcription against a
+    *prefix* of the reference text equal to the clip's duration, so a
+    short chunk-1 partial isn't penalised for not containing the whole
+    sentence. We take the first ``max(chars)`` of the reference that fits
+    into the clip (approximated by chars ∝ duration / 0.06 s per char,
+    typical TTS speaking rate).
+    """
+    if wav.size == 0:
+        return 0.0
+    pcm = _emit_pcm(wav)
+    # Approximate the portion of the reference spoken by this partial: at
+    # ~16 chars/sec the full reference maps to duration ~= len(text)/16.
+    dur_s = len(wav) / float(S3GEN_SR)
+    approx_chars = max(1, int(dur_s * 16))
+    ref_prefix = reference_text[:min(len(reference_text), approx_chars + 10)]
+    return _whisper_score(pcm, ref_prefix, language)
+
+
+def _synthesize_stream_bestof_n(
+    text: str,
+    audio_prompt_path: Optional[str],
+    temperature: float,
+    exaggeration: float,
+    cfg_weight: float,
+    seed: int,
+    language: str,
+    first_chunk_budget_ms: Optional[float],
+    first_chunk_tokens_override: Optional[int],
+    rolling_chunk_tokens: Optional[int],
+    crossfade_ms: float,
+    n_candidates: int,
+):
+    """Best-of-N streaming: run a batched LM (B=2N) for the first K1 tokens
+    only, vocode all N candidate partials, score via the selection STT,
+    commit to the winner, emit chunk 1, then continue rolling decode at B=2
+    from the winner's state to EOS.
+
+    Transition from B=2N → B=2 is done via a single big prefill that replays
+    the winner's first K1-1 sampled tokens (so the B=2 KV cache lands at the
+    exact state the main decode loop expects before iteration i=K1).
+    """
+    try:
+        if seed != 0:
+            set_seed(seed)
+
+        lang = language.lower() if language else "en"
+        if lang not in SUPPORTED_LANGUAGES:
+            logger.warning(f"Unsupported language '{lang}', falling back to 'en'")
+            lang = "en"
+
+        # Chunk sizing (same knobs as the n=1 path).
+        if first_chunk_tokens_override is not None:
+            k1 = max(1, int(first_chunk_tokens_override))
+        else:
+            budget = first_chunk_budget_ms
+            if budget is None:
+                budget = float(config_manager.get_int("streaming.first_chunk_budget_ms", 800))
+            k1 = _compute_first_chunk_tokens(budget)
+
+        if rolling_chunk_tokens is None:
+            rolling_chunk_tokens = config_manager.get_int(
+                "streaming.rolling_chunk_tokens", 0
+            )
+        k_roll = max(10, int(rolling_chunk_tokens)) if rolling_chunk_tokens else k1
+        logger.info(
+            f"Streaming best-of-{n_candidates} config: K1={k1} tokens "
+            f"(~{k1/25.0:.2f} s audio), K_roll={k_roll} tokens "
+            f"(~{k_roll/25.0:.2f} s audio)"
+        )
+
+        denoise_on = _denoise_enabled()
+
+        def _denoise_full_wav(w: np.ndarray) -> np.ndarray:
+            if not denoise_on or w.size == 0:
+                return w
+            d = new_rnnoise_denoiser()
+            if d is None:
+                return w
+            return _denoise_rnnoise(w, d, sr=S3GEN_SR)
+
+        # ---- Encoder + text embedding (shared prefix) ----
+        voice_path = audio_prompt_path or str(_default_voice_path)
+        audio_values, _ = librosa.load(voice_path, sr=S3GEN_SR)
+        audio_values = audio_values[np.newaxis, :].astype(np.float32)
+
+        prepared_text = _prepare_language(text, lang)
+        input_ids = _tokenizer(prepared_text, return_tensors="np")["input_ids"].astype(np.int64)
+        position_ids = np.where(
+            input_ids >= START_SPEECH_TOKEN,
+            0,
+            np.arange(input_ids.shape[1])[np.newaxis, :] - 1,
+        ).astype(np.int64)
+
+        se_out = _speech_encoder_session.run(None, {"audio_values": audio_values})
+        cond_emb_np, prompt_token, ref_x_vector, prompt_feat = se_out
+        cond_emb_b2 = np.broadcast_to(
+            cond_emb_np.astype(np.float16),
+            (2, cond_emb_np.shape[1], cond_emb_np.shape[2]),
+        ).copy()
+        cond_len = cond_emb_b2.shape[1]
+
+        bos_ids = np.array([[START_SPEECH_TOKEN]], dtype=np.int64)
+        input_ids_bos = np.concatenate([input_ids, bos_ids], axis=1)
+        position_ids_bos = np.concatenate(
+            [position_ids, np.array([[0]], dtype=np.int64)], axis=1
+        )
+        input_ids_b2 = np.concatenate([input_ids_bos, input_ids_bos], axis=0)
+        position_ids_b2 = np.concatenate([position_ids_bos, position_ids_bos], axis=0)
+        text_embeds_b2 = _embed_tokens_session.run(None, {
+            "input_ids": input_ids_b2,
+            "position_ids": position_ids_b2,
+            "exaggeration": np.array([exaggeration], dtype=np.float32),
+        })[0]
+        text_len = input_ids.shape[1]
+
+        prefill_embeds_b2 = np.concatenate([cond_emb_b2, text_embeds_b2], axis=1)
+        _, prefill_len, _ = prefill_embeds_b2.shape
+
+        # ---- Batched LM at B=2N for K1 tokens total ----
+        B = 2 * n_candidates
+        prefill_embeds = np.tile(prefill_embeds_b2, (n_candidates, 1, 1))
+        attention_mask = np.ones((B, prefill_len), dtype=np.int64)
+        cfg_scalar = np.array(cfg_weight, dtype=np.float16)
+
+        max_new_tokens = config_manager.get_int("generation_defaults.max_tokens", 800)
+        big_runner = _LMDecodeRunner(
+            _language_model_session,
+            batch=B,
+            max_total_len=prefill_len + k1 + 4,
+        )
+        t_gen_start = time.perf_counter()
+        rep_proc = RepetitionPenaltyLogitsProcessor(penalty=2.0)
+
+        analyzers = [
+            AlignmentStreamAnalyzer(
+                text_tokens_slice=(cond_len, cond_len + text_len),
+                eos_idx=STOP_SPEECH_TOKEN,
+            ) for _ in range(n_candidates)
+        ]
+        gen_tokens = [
+            np.array([[START_SPEECH_TOKEN]], dtype=np.int64)
+            for _ in range(n_candidates)
+        ]
+        last_token = [START_SPEECH_TOKEN] * n_candidates
+        eos_flags = [False] * n_candidates
+
+        logger.info(
+            f"Batched stream best-of-{n_candidates} gen start "
+            f"lang={lang} cond_len={cond_len} text_len={text_len}"
+        )
+
+        # Prefill + first sample per candidate.
+        logits_full, attn_5d = big_runner.run(
+            prefill_embeds, attention_mask, cfg_scalar
+        )
+        for c in range(n_candidates):
+            logits_c = logits_full[c:c + 1, -1, :].astype(np.float32)
+            logits_c = analyzers[c].step(logits_c, attn_5d[:, c], next_token=None)
+            nt_c = _sample(logits_c, gen_tokens[c], temperature, rep_proc)
+            gen_tokens[c] = np.concatenate([gen_tokens[c], nt_c], axis=-1)
+            tok = int(nt_c[0, 0])
+            last_token[c] = tok
+            if tok == STOP_SPEECH_TOKEN:
+                eos_flags[c] = True
+
+        # Decode loop at B=2N up to K1 generated tokens per candidate.
+        # gen_count starts at 1 (we just sampled the first token above).
+        for i in range(1, k1):
+            if all(eos_flags):
+                break
+            nt_b2n = np.array(
+                [[t] for t in last_token for _ in range(2)], dtype=np.int64
+            )
+            pos_ids_b2n = np.full((B, 1), i, dtype=np.int64)
+            step_embeds = _embed_tokens_session.run(None, {
+                "input_ids": nt_b2n,
+                "position_ids": pos_ids_b2n,
+                "exaggeration": np.array([exaggeration], dtype=np.float32),
+            })[0]
+            attention_mask = np.concatenate(
+                [attention_mask, np.ones((B, 1), dtype=np.int64)], axis=1
+            )
+            logits_full, attn_5d = big_runner.run(
+                step_embeds, attention_mask, cfg_scalar
+            )
+            for c in range(n_candidates):
+                if eos_flags[c]:
+                    continue
+                logits_c = logits_full[c:c + 1, -1, :].astype(np.float32)
+                logits_c = analyzers[c].step(
+                    logits_c, attn_5d[:, c], next_token=last_token[c]
+                )
+                nt_c = _sample(logits_c, gen_tokens[c], temperature, rep_proc)
+                gen_tokens[c] = np.concatenate([gen_tokens[c], nt_c], axis=-1)
+                tok = int(nt_c[0, 0])
+                last_token[c] = tok
+                if tok == STOP_SPEECH_TOKEN:
+                    eos_flags[c] = True
+
+        lm_k1_elapsed = time.perf_counter() - t_gen_start
+        lens = [gen_tokens[c].shape[1] - 1 for c in range(n_candidates)]
+        logger.info(
+            f"Batched K1 LM done in {lm_k1_elapsed*1000:.0f}ms, "
+            f"per-cand tokens={lens}, eos={eos_flags}"
+        )
+
+        # ---- Vocode + score each candidate's partial ----
+        crossfade_samples = int(crossfade_ms * S3GEN_SR / 1000.0)
+        tail_margin_samples = CHUNK_TAIL_MARGIN_TOKENS * SAMPLES_PER_SPEECH_TOKEN
+
+        def _cand_vocode(speech_tokens_c: np.ndarray) -> np.ndarray:
+            speech = speech_tokens_c[:, 1:]  # strip BOS
+            if speech.size > 0 and speech[0, -1] == STOP_SPEECH_TOKEN:
+                speech = speech[:, :-1]
+            seq = np.concatenate([prompt_token, speech], axis=1)
+            wav = _cond_decoder_session.run(None, {
+                "speech_tokens": seq,
+                "speaker_embeddings": ref_x_vector,
+                "speaker_features": prompt_feat,
+            })[0]
+            wav = np.squeeze(wav, axis=0)
+            return _denoise_full_wav(wav)
+
+        t_score_start = time.perf_counter()
+        cand_wavs: list = []
+        cand_sims: list = []
+        for c in range(n_candidates):
+            wav_c = _cand_vocode(gen_tokens[c])
+            sim_c = _score_partial_candidate(wav_c, text, lang)
+            cand_wavs.append(wav_c)
+            cand_sims.append(sim_c)
+            logger.info(
+                f"  partial cand {c}: {len(wav_c)/S3GEN_SR:.2f}s, "
+                f"sim={sim_c:.2%}, tokens={lens[c]}, eos={eos_flags[c]}"
+            )
+        score_elapsed = time.perf_counter() - t_score_start
+
+        threshold = config_manager.get_float("candidate_validation_threshold", 0.70)
+        winner = int(np.argmax(cand_sims))
+        if cand_sims[winner] < threshold:
+            # Fallback: pick the candidate with the longest partial (same
+            # rule as _synthesize_batched_bestof_n).
+            winner = int(np.argmax([len(w) for w in cand_wavs]))
+            logger.warning(
+                f"All chunk-1 candidates below threshold "
+                f"({cand_sims[winner]:.2%} < {threshold:.2%}); "
+                f"falling back to longest partial → cand {winner}"
+            )
+        logger.info(
+            f"Streaming best-of-{n_candidates}: chose cand={winner} "
+            f"sim={cand_sims[winner]:.2%} "
+            f"(K1 LM {lm_k1_elapsed*1000:.0f}ms + vocode/score "
+            f"{score_elapsed*1000:.0f}ms)"
+        )
+
+        # ---- Emit chunk 1 from the winner's partial ----
+        state = _RollingStreamState(
+            prompt_token, ref_x_vector, prompt_feat,
+            crossfade_samples, tail_margin_samples, _denoise_full_wav,
+        )
+        # Count the chunk-1 vocode cost toward the rolling total for parity
+        # with the n=1 path's per-call timing log.
+        state.voc_elapsed_total += score_elapsed
+        state.rolling_vocodes += 1
+        winner_is_final = eos_flags[winner] and lens[winner] < k1
+        yield from state.emit_from_wav(cand_wavs[winner], is_final=winner_is_final)
+
+        if winner_is_final:
+            total_elapsed = time.perf_counter() - t_gen_start
+            ttf = (state.t_first_emit - t_gen_start) if state.t_first_emit else total_elapsed
+            logger.info(
+                f"Stream best-of-{n_candidates} done (EOS before K1): "
+                f"ttf={ttf*1000:.0f}ms, total={total_elapsed*1000:.0f}ms, "
+                f"tokens={lens[winner]}, "
+                f"emitted={state.committed_samples/S3GEN_SR:.2f}s audio"
+            )
+            return
+
+        winner_tokens = gen_tokens[winner]  # (1, K1+1) = [BOS, gen_0..gen_{K1-1}]
+        winner_len_after_k1 = winner_tokens.shape[1] - 1  # tokens past BOS
+        # If the winner ran shorter than K1 (its analyzer forced EOS or token
+        # repetition stopped it), we pad last_token but don't continue decode
+        # past its own EOS.  Handled by hit_eos check below.
+
+        # ---- Rebuild B=2 runner and replay the winner's state ----
+        # Build the big B=2 prefill = [cond_emb_b2 | text_embeds | winner_gen_0..{K1-2}]
+        # so that after this one forward pass the B=2 KV cache holds everything
+        # the main decode loop expects before iteration i=K1 (i.e., past_len =
+        # prefill_len + K1 - 1 with the last-fed token at position K1-1).
+        lm_runner = _LMDecodeRunner(
+            _language_model_session,
+            batch=2,
+            max_total_len=prefill_len + max_new_tokens + 8,
+        )
+        # winner_tokens[0, 1..K1-1] are gen_0..gen_{K1-2}; position_ids 1..K1-1.
+        # Edge case: winner already EOS'd at K1-1 or earlier — we still replay
+        # whatever tokens it produced so the LM state matches; the EOS check
+        # stops the continue-loop cleanly.
+        replay_tokens = winner_tokens[:, 1:winner_len_after_k1]  # (1, up-to K1-1)
+        replay_len = replay_tokens.shape[1]
+
+        # Batch=2 (cond/uncond identical row-wise) replay token ids/positions.
+        replay_b2 = np.broadcast_to(replay_tokens, (2, replay_len)).copy()
+        replay_pos_b2 = np.broadcast_to(
+            np.arange(1, replay_len + 1, dtype=np.int64)[None, :],
+            (2, replay_len),
+        ).copy()
+
+        if replay_len > 0:
+            replay_embeds = _embed_tokens_session.run(None, {
+                "input_ids": replay_b2,
+                "position_ids": replay_pos_b2,
+                "exaggeration": np.array([exaggeration], dtype=np.float32),
+            })[0]
+            big_prefill = np.concatenate(
+                [cond_emb_b2, text_embeds_b2, replay_embeds], axis=1
+            )
+        else:
+            big_prefill = np.concatenate([cond_emb_b2, text_embeds_b2], axis=1)
+
+        big_mask = np.ones((2, big_prefill.shape[1]), dtype=np.int64)
+        t_replay = time.perf_counter()
+        replay_logits, replay_attn = lm_runner.run(big_prefill, big_mask, cfg_scalar)
+        replay_elapsed = time.perf_counter() - t_replay
+        logger.info(
+            f"B=2 replay prefill ({big_prefill.shape[1]} positions) in "
+            f"{replay_elapsed*1000:.0f}ms"
+        )
+
+        # ---- Continue rolling decode from the winner's state at B=2 ----
+        # A fresh single-candidate analyzer is primed with the replay prefill's
+        # attention so it initializes its alignment state the same way the
+        # first call in the n=1 path does (T_q spans cond+text+speech, hits
+        # the "curr_frame_pos == 0" branch correctly).  Logits we discard —
+        # we're not sampling from this call, the winner already picked the
+        # last token in the batched phase.
+        analyzer = AlignmentStreamAnalyzer(
+            text_tokens_slice=(cond_len, cond_len + text_len),
+            eos_idx=STOP_SPEECH_TOKEN,
+        )
+        _prime_logits = replay_logits[:, -1, :].astype(np.float32)
+        analyzer.step(_prime_logits, _attn_for_cand(replay_attn), next_token=None)
+        generate_tokens = winner_tokens.copy()
+        attention_mask = big_mask
+        last_vocode_gen_count = winner_len_after_k1  # chunk-1 already emitted
+        next_token = np.array([[last_token[winner]]], dtype=np.int64)
+        hit_eos = eos_flags[winner]
+        steps_run = replay_len + 1  # prefill + first sample equivalent
+
+        if not hit_eos:
+            # Main decode starts at position i = K1 (feed gen_{K1-1} at that
+            # position to sample gen_K1).
+            for i in range(winner_len_after_k1, max_new_tokens):
+                nt_b2 = np.concatenate([next_token, next_token], axis=0)
+                pos_ids_b2 = np.full((2, 1), i, dtype=np.int64)
+                step_embeds = _embed_tokens_session.run(None, {
+                    "input_ids": nt_b2,
+                    "position_ids": pos_ids_b2,
+                    "exaggeration": np.array([exaggeration], dtype=np.float32),
+                })[0]
+                attention_mask = np.concatenate(
+                    [attention_mask, np.ones((2, 1), dtype=np.int64)], axis=1
+                )
+                logits_out, attn_raw = lm_runner.run(
+                    step_embeds, attention_mask, cfg_scalar
+                )
+                logits_step = logits_out[:, -1, :].astype(np.float32)
+                logits_step = analyzer.step(
+                    logits_step, _attn_for_cand(attn_raw),
+                    next_token=int(next_token[0, 0]),
+                )
+                next_token = _sample(logits_step, generate_tokens, temperature, rep_proc)
+                generate_tokens = np.concatenate([generate_tokens, next_token], axis=-1)
+                steps_run += 1
+
+                if int(next_token[0, 0]) == STOP_SPEECH_TOKEN:
+                    logger.info(f"EOS at step {i+1}")
+                    hit_eos = True
+                    break
+
+                gen_count = generate_tokens.shape[1] - 1
+                if gen_count >= last_vocode_gen_count + k_roll:
+                    yield from state.emit_with_vocode(
+                        generate_tokens, is_final=False
+                    )
+                    state.rolling_vocodes += 1
+                    last_vocode_gen_count = gen_count
+            else:
+                logger.warning(
+                    f"Hit max_new_tokens={max_new_tokens} without EOS"
+                )
+
+        yield from state.emit_with_vocode(generate_tokens, is_final=True)
+
+        total_elapsed = time.perf_counter() - t_gen_start
+        ttf = (state.t_first_emit - t_gen_start) if state.t_first_emit else total_elapsed
+        final_tokens = generate_tokens.shape[1] - 1
+        logger.info(
+            f"Stream best-of-{n_candidates} done: ttf={ttf*1000:.0f}ms, "
+            f"vocoder={state.voc_elapsed_total*1000:.0f}ms total across "
+            f"{state.rolling_vocodes + 1} calls (incl. chunk-1 batched), "
+            f"total={total_elapsed*1000:.0f}ms, tokens={final_tokens}, "
+            f"emitted={state.committed_samples/S3GEN_SR:.2f}s audio"
+        )
+
+    except Exception as e:
+        logger.error(
+            f"ONNX v2 stream best-of-{n_candidates} error: {e}",
+            exc_info=True,
+        )
+        return
+
+
 def synthesize_stream(
     text: str,
     audio_prompt_path: Optional[str] = None,
@@ -1337,24 +1928,62 @@ def synthesize_stream(
     language: str = "en",
     first_chunk_budget_ms: Optional[float] = None,
     first_chunk_tokens_override: Optional[int] = None,
+    rolling_chunk_tokens: Optional[int] = None,
     crossfade_ms: float = 30.0,
+    n_candidates: Optional[int] = None,
 ):
     """Generator yielding (pcm_bytes, sample_rate) for the utterance.
 
-    Fires the vocoder twice per utterance in the common case:
-    - Chunk 1 once we've decoded K1 speech tokens (K1 derived from budget)
-    - Chunk 2 after EOS, on [prompt | all generated]
+    Rolling N-chunk vocoder. The decode loop fires the vocoder every K tokens:
 
-    The two vocoder passes overlap in time-domain content; chunk 2's start
-    re-generates chunk 1's audio up to the boundary. We hold back the last
-    `crossfade_ms` of chunk 1's emitted audio and cross-fade into chunk 2's
-    corresponding region to mask CFM noise differences at the boundary.
+    - First vocode at K1 tokens (K1 derived from `first_chunk_budget_ms`)
+    - Subsequent vocodes every `rolling_chunk_tokens` more tokens (default K1)
+    - Final vocode at EOS
 
-    If EOS fires before K1 (short utterance), yields one chunk identical to
-    `synthesize()`'s output (no streaming boundary to worry about).
+    Each non-final vocode runs `cond_decoder` on ``[prompt | tokens_so_far]``,
+    discards the last ``CHUNK_TAIL_MARGIN_TOKENS`` of audio (no future context),
+    holds back the last ``crossfade_ms`` of the reliable region, and emits the
+    body.  On the next vocode we crossfade the held-back tail with the matching
+    region of the new (longer) output, emit the blend + next body, hold the new
+    tail.  At EOS we do one more vocode with no tail margin and emit the rest.
+
+    This solves the long-utterance buffer-underrun bug that the old two-chunk
+    design had: the client now receives a new chunk every ~K tokens worth of
+    audio rather than waiting until EOS for chunk 2.
+
+    If EOS fires before K1 (short utterance), we emit a single chunk identical
+    to ``synthesize()``'s output with no streaming boundary.
+
+    When ``n_candidates > 1`` the first chunk is produced via a batched LM at
+    B=2N pairs (best-of-N on the first K1 tokens only), scored via the
+    selection STT, committed to the winner, then the rolling decode continues
+    at B=2 from there.  Expected TTFA 1.5-2 s for n=3 on DGX Spark.
     """
     if not MODEL_LOADED:
         logger.error("ONNX v2 TTS model is not loaded.")
+        return
+
+    # Resolve n_candidates: caller wins, else config default.  n<=1 stays on
+    # the single-candidate rolling path below; n>1 dispatches to the batched
+    # commit-at-chunk-1 path.
+    if n_candidates is None:
+        n_candidates = config_manager.get_int("n_candidates", 1)
+    n_candidates = max(1, int(n_candidates))
+    if n_candidates > 1:
+        yield from _synthesize_stream_bestof_n(
+            text=text,
+            audio_prompt_path=audio_prompt_path,
+            temperature=temperature,
+            exaggeration=exaggeration,
+            cfg_weight=cfg_weight,
+            seed=seed,
+            language=language,
+            first_chunk_budget_ms=first_chunk_budget_ms,
+            first_chunk_tokens_override=first_chunk_tokens_override,
+            rolling_chunk_tokens=rolling_chunk_tokens,
+            crossfade_ms=crossfade_ms,
+            n_candidates=n_candidates,
+        )
         return
 
     try:
@@ -1375,14 +2004,24 @@ def synthesize_stream(
             if budget is None:
                 budget = float(config_manager.get_int("streaming.first_chunk_budget_ms", 800))
             k1 = _compute_first_chunk_tokens(budget)
-        logger.info(f"Streaming config: K1={k1} tokens (~{k1/25.0:.2f} s audio)")
+
+        # Rolling chunk size defaults to K1 so every chunk carries ~equal audio
+        # duration and ~equal vocode wall-time (predictable pacing for the
+        # client).  Config knob lets us tune without a code change.
+        if rolling_chunk_tokens is None:
+            rolling_chunk_tokens = config_manager.get_int(
+                "streaming.rolling_chunk_tokens", 0
+            )
+        k_roll = max(10, int(rolling_chunk_tokens)) if rolling_chunk_tokens else k1
+        logger.info(
+            f"Streaming config: K1={k1} tokens (~{k1/25.0:.2f} s audio), "
+            f"K_roll={k_roll} tokens (~{k_roll/25.0:.2f} s audio)"
+        )
 
         # Phase 2a: RNNoise post-pass. Use a FRESH denoiser per vocoder output
-        # (not per emitted sub-chunk) so that sample boundaries inside one
-        # vocoder output stay continuous, and the two vocoder passes (chunk 1
-        # and chunk 2) each get their own clean state. Matters for the
-        # crossfade: denoising each vocoder output independently keeps content
-        # at matching sample positions filter-aligned between chunk1 and chunk2.
+        # so that sample boundaries inside one vocoder output stay continuous,
+        # and each rolling vocode gets its own clean state.  The crossfade at
+        # the right edge masks the small state-init difference between calls.
         denoise_on = _denoise_enabled()
 
         def _denoise_full_wav(w: np.ndarray) -> np.ndarray:
@@ -1441,7 +2080,6 @@ def synthesize_stream(
             max_total_len=prefill_len + max_new_tokens + 8,
         )
         t_gen_start = time.perf_counter()
-        t_first_emit = None
         rep_proc = RepetitionPenaltyLogitsProcessor(penalty=2.0)
         generate_tokens = np.array([[START_SPEECH_TOKEN]], dtype=np.int64)
 
@@ -1463,10 +2101,14 @@ def synthesize_stream(
 
         steps_run = 1
         hit_eos = int(next_token[0, 0]) == STOP_SPEECH_TOKEN
-        chunk1_emitted = False     # did we emit a partial chunk before EOS?
+
         crossfade_samples = int(crossfade_ms * S3GEN_SR / 1000.0)
-        held_back_tail: Optional[np.ndarray] = None  # fade-out region held back for crossfade
-        chunk1_audio_len: Optional[int] = None  # chunk 1's emitted audio length in samples
+        tail_margin_samples = CHUNK_TAIL_MARGIN_TOKENS * SAMPLES_PER_SPEECH_TOKEN
+        state = _RollingStreamState(
+            prompt_token, ref_x_vector, prompt_feat,
+            crossfade_samples, tail_margin_samples, _denoise_full_wav,
+        )
+        last_vocode_gen_count = 0  # generate_tokens count at last vocode fire
 
         if not hit_eos:
             for i in range(1, max_new_tokens):
@@ -1492,116 +2134,36 @@ def synthesize_stream(
                     hit_eos = True
                     break
 
-                # Fire chunk 1 vocoder once we've accumulated K1 generated tokens
-                # (prefix excludes the seed START_SPEECH_TOKEN, hence -1).
-                if (not chunk1_emitted) and (steps_run - 1 >= k1):
-                    gen_tail = generate_tokens[:, 1:]  # strip START_SPEECH_TOKEN
-                    chunk1_tokens = np.concatenate([prompt_token, gen_tail], axis=1)
-                    wav_c1 = _cond_decoder_session.run(None, {
-                        "speech_tokens": chunk1_tokens,
-                        "speaker_embeddings": ref_x_vector,
-                        "speaker_features": prompt_feat,
-                    })[0]
-                    # Decoder already trims prompt audio internally — wav_c1 is
-                    # just the generated speech.
-                    gen_audio_c1 = np.squeeze(wav_c1, axis=0)
-                    # Denoise the full chunk-1 waveform BEFORE slicing into
-                    # reliable / held_back / emit regions so the splits stay
-                    # aligned (RNNoise is stateful across frames within one call).
-                    gen_audio_c1 = _denoise_full_wav(gen_audio_c1)
-
-                    # Discard chunk 1's last CHUNK1_TAIL_MARGIN_TOKENS worth of
-                    # audio: the vocoder generated those without future context
-                    # and they tend to contain edge artifacts (dropped consonants,
-                    # flutter). Chunk 2 re-generates them with full context.
-                    CHUNK1_TAIL_MARGIN_TOKENS = 3
-                    margin_samples = CHUNK1_TAIL_MARGIN_TOKENS * SAMPLES_PER_SPEECH_TOKEN
-                    reliable_end = max(0, len(gen_audio_c1) - margin_samples)
-                    reliable = gen_audio_c1[:reliable_end]
-                    chunk1_audio_len = reliable_end
-
-                    # Emit everything except the last crossfade_samples of the
-                    # reliable region, which we hold back and blend with chunk 2.
-                    if len(reliable) > crossfade_samples:
-                        emit_now = reliable[:-crossfade_samples]
-                        held_back_tail = reliable[-crossfade_samples:]
-                    else:
-                        # Reliable audio shorter than crossfade window — emit
-                        # all, no crossfade.
-                        emit_now = reliable
-                        held_back_tail = None
-                    if t_first_emit is None:
-                        t_first_emit = time.perf_counter()
-                    yield _emit_pcm(emit_now), S3GEN_SR
-                    chunk1_emitted = True
+                # gen_count = generated speech tokens so far (excluding the
+                # seed BOS).  Fire the first rolling vocode at K1, then every
+                # K_roll tokens after that.
+                gen_count = generate_tokens.shape[1] - 1
+                if state.rolling_vocodes == 0:
+                    threshold = k1
+                else:
+                    threshold = last_vocode_gen_count + k_roll
+                if gen_count >= threshold:
+                    yield from state.emit_with_vocode(generate_tokens, is_final=False)
+                    state.rolling_vocodes += 1
+                    last_vocode_gen_count = gen_count
             else:
                 logger.warning(f"Hit max_new_tokens={max_new_tokens} without EOS")
 
-        # Strip BOS, EOS (if present) and prepend reference prompt tokens.
-        speech_tokens = generate_tokens[:, 1:]
-        if speech_tokens.size > 0 and speech_tokens[0, -1] == STOP_SPEECH_TOKEN:
-            speech_tokens = speech_tokens[:, :-1]
-        speech_tokens = np.concatenate([prompt_token, speech_tokens], axis=1)
+        # Final vocode: covers EOS + any tokens generated since the last
+        # rolling call, with no tail margin discarded.
+        yield from state.emit_with_vocode(generate_tokens, is_final=True)
 
         lm_elapsed = time.perf_counter() - t_gen_start
+        ttf = (state.t_first_emit - t_gen_start) if state.t_first_emit else lm_elapsed
+        final_tokens = generate_tokens.shape[1] - 1
         logger.info(
-            f"Stream LM done: {speech_tokens.shape[1]} tokens in {steps_run} steps "
-            f"({lm_elapsed:.2f}s, {lm_elapsed/max(steps_run,1)*1000:.1f}ms/step)"
-        )
-
-        # Final vocoder pass on the full token sequence. Decoder already trims
-        # prompt audio — gen_audio_full is just the generated speech.
-        t_voc = time.perf_counter()
-        wav_full = _cond_decoder_session.run(None, {
-            "speech_tokens": speech_tokens,
-            "speaker_embeddings": ref_x_vector,
-            "speaker_features": prompt_feat,
-        })[0]
-        gen_audio_full = np.squeeze(wav_full, axis=0)
-        # Phase 2a: denoise the full chunk-2 waveform before crossfade math
-        # (fresh denoiser state matches chunk-1's fresh state so corresponding
-        # sample positions stay filter-aligned).
-        gen_audio_full = _denoise_full_wav(gen_audio_full)
-        voc_elapsed = time.perf_counter() - t_voc
-
-        if chunk1_emitted and held_back_tail is not None and chunk1_audio_len is not None:
-            # Crossfade at the boundary. Chunk 1 emitted audio up to
-            # chunk1_audio_len - crossfade_samples; we held back the trailing
-            # crossfade_samples. Blend those with the corresponding region of
-            # chunk 2's output, then emit the rest of chunk 2.
-            boundary = chunk1_audio_len  # sample offset inside gen_audio_full
-            xfade_start = boundary - crossfade_samples
-            xfade_end = boundary
-            if xfade_start < 0 or xfade_end > len(gen_audio_full):
-                # Shouldn't happen; fall back to plain emission of new tail only.
-                logger.warning("Crossfade window out of range — emitting hard boundary")
-                yield _emit_pcm(held_back_tail), S3GEN_SR
-                yield _emit_pcm(gen_audio_full[boundary:]), S3GEN_SR
-            else:
-                head_b = gen_audio_full[xfade_start:xfade_end]
-                blended = _linear_crossfade(held_back_tail, head_b)
-                tail_rest = gen_audio_full[xfade_end:]
-                yield _emit_pcm(blended), S3GEN_SR
-                if len(tail_rest) > 0:
-                    yield _emit_pcm(tail_rest), S3GEN_SR
-        elif chunk1_emitted:
-            # Streamed chunk 1 but had no held_back (chunk shorter than crossfade
-            # window). Emit everything past chunk 1's end from chunk 2.
-            if chunk1_audio_len is not None:
-                tail_rest = gen_audio_full[chunk1_audio_len:]
-                if len(tail_rest) > 0:
-                    yield _emit_pcm(tail_rest), S3GEN_SR
-        else:
-            # Never streamed (utterance shorter than K1) — emit everything now.
-            if t_first_emit is None:
-                t_first_emit = time.perf_counter()
-            yield _emit_pcm(gen_audio_full), S3GEN_SR
-
-        total_elapsed = time.perf_counter() - t_gen_start
-        ttf = (t_first_emit - t_gen_start) if t_first_emit else total_elapsed
-        logger.info(
-            f"Stream done: ttf={ttf*1000:.0f}ms, vocoder={voc_elapsed*1000:.0f}ms, "
-            f"total={total_elapsed*1000:.0f}ms, chunks=2 (streamed={chunk1_emitted})"
+            f"Stream done: ttf={ttf*1000:.0f}ms, "
+            f"vocoder={state.voc_elapsed_total*1000:.0f}ms total across "
+            f"{state.rolling_vocodes + 1} calls, "
+            f"lm={lm_elapsed*1000:.0f}ms over {steps_run} steps "
+            f"({lm_elapsed/max(steps_run,1)*1000:.1f}ms/step), "
+            f"tokens={final_tokens}, "
+            f"emitted={state.committed_samples/S3GEN_SR:.2f}s audio"
         )
 
     except Exception as e:

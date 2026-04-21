@@ -1355,6 +1355,9 @@ async def stream_tts_endpoint(request: CustomTTSRequest):
     crossfade_ms = float(config_manager.get_int("streaming.crossfade_ms", 30))
     override = config_manager.get("streaming.first_chunk_tokens_override", None)
     first_chunk_tokens_override = int(override) if override is not None else None
+    roll = config_manager.get("streaming.rolling_chunk_tokens", None)
+    # Accept 0 / null / missing as "use K1" — the engine handles the fallback.
+    rolling_chunk_tokens = int(roll) if roll not in (None, "", 0) else None
 
     sample_rate = engine.S3GEN_SR
 
@@ -1372,7 +1375,12 @@ async def stream_tts_endpoint(request: CustomTTSRequest):
                 language=request.language if request.language is not None else get_gen_default_language(),
                 first_chunk_budget_ms=first_chunk_budget_ms,
                 first_chunk_tokens_override=first_chunk_tokens_override,
+                rolling_chunk_tokens=rolling_chunk_tokens,
                 crossfade_ms=crossfade_ms,
+                **({"n_candidates": request.n_candidates}
+                   if getattr(request, "n_candidates", None) is not None
+                   and "n_candidates" in engine.synthesize_stream.__code__.co_varnames
+                   else {}),
             ):
                 if pcm_bytes:
                     yield pcm_bytes
