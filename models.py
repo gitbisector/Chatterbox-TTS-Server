@@ -93,6 +93,16 @@ class CustomTTSRequest(BaseModel):
     language: Optional[str] = Field(
         None, description="Overrides default language if provided."
     )
+    n_candidates: Optional[int] = Field(
+        None,
+        ge=1,
+        le=5,
+        description=(
+            "Best-of-N synthesis: run N candidates through a batched LM call, "
+            "Whisper-validate each, return the best. Higher N improves quality "
+            "at proportional cost. 1 = disable (fastest). Default from config."
+        ),
+    )
 
 
 class ErrorResponse(BaseModel):

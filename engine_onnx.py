@@ -334,9 +334,15 @@ def load_model() -> bool:
             from engine_trt_lm import TRTLanguageModelSession  # lazy — avoids tensorrt import on ort-only hosts
             _language_model_session = TRTLanguageModelSession(str(engine_path))
         else:
-            logger.info("Loading language_model_v2 (CFG + attention, fp16 ONNX)...")
+            lm_onnx_rel = config_manager.get_string(
+                "tts_engine.lm_onnx_path", "language_model_v2.onnx"
+            )
+            lm_onnx_path = Path(lm_onnx_rel)
+            if not lm_onnx_path.is_absolute():
+                lm_onnx_path = v2_dir / lm_onnx_rel
+            logger.info(f"Loading language_model_v2 (ONNX) from {lm_onnx_path}...")
             _language_model_session = ort.InferenceSession(
-                str(v2_dir / "language_model_v2.onnx"), sess_options, providers=providers
+                str(lm_onnx_path), sess_options, providers=providers
             )
         _lm_output_names = [o.name for o in _language_model_session.get_outputs()]
         logger.info(f"LM ({_lm_backend}) has {len(_lm_output_names)} outputs: logits, attn_layers, + {len(_lm_output_names)-2} present KV entries")
@@ -836,11 +842,17 @@ def _denoise_enabled() -> bool:
 
 def _whisper_score(wav_i16: bytes, reference_text: str, language: str,
                    timeout_s: float = 15.0) -> float:
-    """POST a WAV to the local Whisper service and return difflib similarity
+    """POST a WAV to the selection STT service and return difflib similarity
     of the transcription vs ``reference_text``. Returns 0.0 on any error.
+
+    Defaults to the ``selection_stt.*`` config block (parakeet-nemo on
+    172.20.0.1:9002 at /asr). Falls back to the ``whisper.*`` block with
+    ``/asr?output=txt`` when ``selection_stt`` is unset. The name is kept
+    as ``_whisper_score`` for call-site stability.
     """
     import difflib
     import io
+    import json
     import re
     import wave
     import urllib.request
@@ -855,9 +867,22 @@ def _whisper_score(wav_i16: bytes, reference_text: str, language: str,
             w.writeframes(wav_i16)
         wav_bytes = buf.getvalue()
 
-        host = config_manager.get_string("whisper.host", "localhost")
-        port = config_manager.get_int("whisper.port", 9001)
-        url = f"http://{host}:{port}/asr?task=transcribe&language={language}&output=txt"
+        # Prefer the selection_stt config block; fall back to whisper.* so
+        # existing deployments without the new key keep working.
+        host = config_manager.get_string(
+            "selection_stt.host",
+            config_manager.get_string("whisper.host", "localhost"),
+        )
+        port = config_manager.get_int(
+            "selection_stt.port",
+            config_manager.get_int("whisper.port", 9001),
+        )
+        path = config_manager.get_string("selection_stt.path", "/asr")
+        response_fmt = config_manager.get_string("selection_stt.response", "json").lower()
+        url = (
+            f"http://{host}:{port}{path}"
+            f"?task=transcribe&language={language}&output=json"
+        )
 
         # multipart/form-data for the POST.
         boundary = "----candidateform"
@@ -872,7 +897,15 @@ def _whisper_score(wav_i16: bytes, reference_text: str, language: str,
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            heard = resp.read().decode("utf-8", errors="replace").strip()
+            raw = resp.read().decode("utf-8", errors="replace").strip()
+
+        if response_fmt == "json":
+            try:
+                heard = json.loads(raw).get("text", raw).strip()
+            except json.JSONDecodeError:
+                heard = raw  # tolerate services that ignore output=json
+        else:
+            heard = raw
 
         def norm(s: str) -> str:
             s = s.lower()
@@ -881,7 +914,7 @@ def _whisper_score(wav_i16: bytes, reference_text: str, language: str,
 
         return difflib.SequenceMatcher(None, norm(reference_text), norm(heard)).ratio()
     except Exception as e:
-        logger.warning(f"Whisper validation failed: {e}")
+        logger.warning(f"Selection STT scoring failed: {e}")
         return 0.0
 
 
@@ -1048,20 +1081,29 @@ def _synthesize_batched_bestof_n(
         if speech_c.size > 0 and speech_c[0, -1] == STOP_SPEECH_TOKEN:
             speech_c = speech_c[:, :-1]
         speech_c = np.concatenate([prompt_token, speech_c], axis=1)
+        t_dec = time.perf_counter()
         wav_c = _cond_decoder_session.run(None, {
             "speech_tokens": speech_c,
             "speaker_embeddings": ref_x_vector,
             "speaker_features": prompt_feat,
         })[0]
+        dec_ms = (time.perf_counter() - t_dec) * 1000
         wav_c = np.squeeze(wav_c, axis=0)
+        t_dn = time.perf_counter()
         if _denoise_enabled():
             d = new_rnnoise_denoiser()
             if d is not None:
                 wav_c = _denoise_rnnoise(wav_c, d, sr=S3GEN_SR)
+        dn_ms = (time.perf_counter() - t_dn) * 1000
         # PCM int16 bytes for Whisper
         pcm = _emit_pcm(wav_c)
+        t_w = time.perf_counter()
         sim = _whisper_score(pcm, text, lang)
-        logger.info(f"  candidate {c}: {len(wav_c)/S3GEN_SR:.2f}s, sim={sim:.2%}")
+        w_ms = (time.perf_counter() - t_w) * 1000
+        logger.info(
+            f"  candidate {c}: {len(wav_c)/S3GEN_SR:.2f}s, sim={sim:.2%} "
+            f"[dec={dec_ms:.0f}ms dn={dn_ms:.0f}ms whisper={w_ms:.0f}ms]"
+        )
         candidates.append({"wav": wav_c, "sim": sim, "idx": c})
 
     if not candidates:

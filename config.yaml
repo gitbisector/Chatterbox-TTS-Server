@@ -27,6 +27,10 @@ tts_engine:
   # resolve against CHATTERBOX_ONNX_DIR (the directory holding the v2 ONNX
   # graphs); absolute paths are used as-is.
   lm_engine_path: trt-int8/language_model_v2.fp16.engine
+  # Path to the LM ONNX graph, used only when lm_backend = ort. Lets you
+  # swap fp16 vs weight-only INT4 (language_model_v2.int4.onnx) without
+  # rebuilding the image. Relative paths resolve against CHATTERBOX_ONNX_DIR.
+  lm_onnx_path: language_model_v2.onnx
 paths:
   model_cache: model_cache
   output: outputs
@@ -75,6 +79,18 @@ whisper:
   # (the bridge chatterbox sits on) and forwards to the host's port 9001.
   host: 172.20.0.1
   port: 9001
+
+selection_stt:
+  # STT service used to score candidates in best-of-N (n_candidates > 1).
+  # Parakeet-TDT is ~4× faster than whisper-int8 and ~9× faster than whisper-fp32
+  # on GB10 for clean ~8s TTS clips, while keeping transcript fidelity (verified
+  # on EN + NL). Set `host: 172.20.0.1  port: 9001` to fall back to whisper.
+  # Path must accept a multipart `audio_file` field and return either
+  # `{"text": "..."}` JSON or a bare transcript in the body.
+  host: 172.20.0.1
+  port: 9002
+  path: /asr
+  response: json  # "json" to parse {"text": ...}, "text" for raw body
 audio_output:
   format: wav
   sample_rate: 24000

@@ -46,3 +46,10 @@ htmlcov/
 
 # Ignore log files
 *.log
+
+# Large model artifacts (ONNX weights, TRT engines, ORT wheels)
+onnx-models/
+ort-wheels/
+*.engine
+*.onnx_data
+*.onnx_data.bak

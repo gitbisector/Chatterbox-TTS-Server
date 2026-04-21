@@ -60,7 +60,10 @@ from config import (
     get_audio_output_format,
 )
 
-import engine  # TTS Engine interface
+if os.environ.get("CHATTERBOX_ENGINE") == "onnx":
+    import engine_onnx as engine  # ONNX Runtime TTS Engine
+else:
+    import engine  # PyTorch TTS Engine
 from models import (  # Pydantic models
     CustomTTSRequest,
     ErrorResponse,
@@ -403,6 +406,14 @@ async def get_web_ui(request: Request):
             "Please check server logs for more details.</p></body></html>",
             status_code=500,
         )
+
+
+# --- Health check (for docker healthcheck, load balancers, monitoring) ---
+@app.get("/health", tags=["Health"], include_in_schema=False)
+async def health_endpoint():
+    if not getattr(engine, "MODEL_LOADED", False):
+        raise HTTPException(status_code=503, detail="model not loaded")
+    return {"status": "ok", "model_loaded": True}
 
 
 # --- API Endpoint for Model Information ---
@@ -980,6 +991,12 @@ async def custom_tts_endpoint(
                     if request.language is not None
                     else get_gen_default_language()
                 ),
+                # Best-of-N: honoured only when the engine supports it
+                # (ONNX engine does; PyTorch engine ignores the kwarg).
+                **({"n_candidates": request.n_candidates}
+                   if getattr(request, "n_candidates", None) is not None
+                   and "n_candidates" in engine.synthesize.__code__.co_varnames
+                   else {}),
             )
             perf_monitor.record(f"Engine synthesized chunk {i+1}")
 
@@ -1257,6 +1274,119 @@ async def custom_tts_endpoint(
     return StreamingResponse(
         io.BytesIO(encoded_audio_bytes), media_type=media_type, headers=headers
     )
+
+# ---- Streaming helpers (ONNX engine only) ----
+def _streaming_wav_header(sample_rate: int, channels: int = 1, bits: int = 16) -> bytes:
+    """Minimal 44-byte WAV header with a sentinel 'unknown length' data size.
+
+    Writing 0xFFFFFFFF (or 0x7FFFFFFF commonly accepted) into the RIFF and
+    data-chunk sizes signals to streaming players that the stream has unknown
+    length. Most players (ffmpeg, VLC, web Audio API via MSE) accept this.
+    """
+    byte_rate = sample_rate * channels * bits // 8
+    block_align = channels * bits // 8
+    # Use 0xFFFFFFFF sentinels for both top-level and data-chunk sizes.
+    header = bytearray()
+    header += b"RIFF"
+    header += (0xFFFFFFFF).to_bytes(4, "little")  # total size - 8 (unknown)
+    header += b"WAVE"
+    header += b"fmt "
+    header += (16).to_bytes(4, "little")          # fmt chunk size
+    header += (1).to_bytes(2, "little")           # PCM format
+    header += channels.to_bytes(2, "little")
+    header += sample_rate.to_bytes(4, "little")
+    header += byte_rate.to_bytes(4, "little")
+    header += block_align.to_bytes(2, "little")
+    header += bits.to_bytes(2, "little")
+    header += b"data"
+    header += (0xFFFFFFFF).to_bytes(4, "little")  # data size (unknown)
+    return bytes(header)
+
+
+@app.post(
+    "/tts/stream",
+    tags=["TTS Generation"],
+    summary="Stream speech as PCM WAV with low first-audio latency",
+    responses={
+        200: {"content": {"audio/wav": {}}, "description": "Streaming WAV."},
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+        501: {"model": ErrorResponse, "description": "Streaming requires the ONNX engine."},
+        503: {"model": ErrorResponse},
+    },
+)
+async def stream_tts_endpoint(request: CustomTTSRequest):
+    """Low-latency streaming TTS. Yields a single utterance's audio as WAV bytes
+    over chunked HTTP, delivering the first audio well before the full utterance
+    is synthesized. Intended for interactive/conversational use cases.
+
+    Unlike /tts this endpoint does NOT split long input into sentences — clients
+    wanting sentence-level batching should call /tts/stream once per sentence.
+    """
+    if not hasattr(engine, "synthesize_stream"):
+        raise HTTPException(
+            status_code=501,
+            detail="Streaming is only available with the ONNX engine "
+                   "(CHATTERBOX_ENGINE=onnx).",
+        )
+    if not engine.MODEL_LOADED:
+        raise HTTPException(status_code=503, detail="TTS engine model is not loaded.")
+
+    # Resolve voice path exactly the same way as /tts.
+    audio_prompt_path: Optional[Path] = None
+    if request.voice_mode == "predefined":
+        if not request.predefined_voice_id:
+            raise HTTPException(status_code=400, detail="Missing 'predefined_voice_id'.")
+        potential_path = get_predefined_voices_path(ensure_absolute=True) / request.predefined_voice_id
+        if not potential_path.is_file():
+            raise HTTPException(status_code=404, detail=f"Voice '{request.predefined_voice_id}' not found.")
+        audio_prompt_path = potential_path
+    elif request.voice_mode == "clone":
+        if not request.reference_audio_filename:
+            raise HTTPException(status_code=400, detail="Missing 'reference_audio_filename'.")
+        potential_path = get_reference_audio_path(ensure_absolute=True) / request.reference_audio_filename
+        if not potential_path.is_file():
+            raise HTTPException(status_code=404, detail=f"Reference audio '{request.reference_audio_filename}' not found.")
+        audio_prompt_path = potential_path
+
+    # Pull the optional streaming knobs from config.
+    first_chunk_budget_ms = float(config_manager.get_int("streaming.first_chunk_budget_ms", 800))
+    crossfade_ms = float(config_manager.get_int("streaming.crossfade_ms", 30))
+    override = config_manager.get("streaming.first_chunk_tokens_override", None)
+    first_chunk_tokens_override = int(override) if override is not None else None
+
+    sample_rate = engine.S3GEN_SR
+
+    def pcm_generator():
+        # Emit WAV header first so the client can start decoding on byte 0.
+        yield _streaming_wav_header(sample_rate)
+        try:
+            for pcm_bytes, _sr in engine.synthesize_stream(
+                text=request.text,
+                audio_prompt_path=str(audio_prompt_path) if audio_prompt_path else None,
+                temperature=request.temperature if request.temperature is not None else get_gen_default_temperature(),
+                exaggeration=request.exaggeration if request.exaggeration is not None else get_gen_default_exaggeration(),
+                cfg_weight=request.cfg_weight if request.cfg_weight is not None else get_gen_default_cfg_weight(),
+                seed=request.seed if request.seed is not None else get_gen_default_seed(),
+                language=request.language if request.language is not None else get_gen_default_language(),
+                first_chunk_budget_ms=first_chunk_budget_ms,
+                first_chunk_tokens_override=first_chunk_tokens_override,
+                crossfade_ms=crossfade_ms,
+            ):
+                if pcm_bytes:
+                    yield pcm_bytes
+        except Exception as e:
+            logger.error(f"Streaming synthesis failed: {e}", exc_info=True)
+            # Can't raise HTTPException mid-stream; log and let the connection close.
+            return
+
+    return StreamingResponse(
+        pcm_generator(),
+        media_type="audio/wav",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"},
+    )
+
 
 @app.get("/v1/audio/voices", tags=["llama-swap Compatible"])
 # llama-swap, koboldcpp, and probably some more use this
